@@ -105,12 +105,6 @@ class Config:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 
-cfg = Config()
-
-# اصلاح خودکار آدرس دیتابیس Railway برای استفاده از asyncpg
-if cfg.DATABASE_URL and not cfg.DATABASE_URL.startswith("postgresql+asyncpg://"):
-    cfg.DATABASE_URL = cfg.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-    cfg.DATABASE_URL = cfg.DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
     # ── Game Balance ─────────────────────────────────────────────
     MAX_ENERGY: int = 100
