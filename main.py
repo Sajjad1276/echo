@@ -98,10 +98,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ─────────────────────────────────────────────────────────────────
 
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    BOT_TOKEN: str = ("8949627689:AAEiRm5zps0ihAHxKlTDUTimz5h3pLvbB5c")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://echo:echo@localhost:5432/echo")
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    ADMIN_IDS: list[int] = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+    ADMIN_IDS: list[int] = [int(x) for x in ("7869872051").split(",") if x.strip()]
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 
