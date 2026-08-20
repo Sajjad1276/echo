@@ -2,1114 +2,2639 @@
 # ECHO — CORE GAME ENGINE
 # FILE: game.py
 # ================================================================
-# Pipeline:
-#   GameContext → Intent/Session → Action → State → GameResponse
 #
-# Dependencies: config.py, database.py
-# No Telegram UI objects. No circular imports.
+# ECHO GAME ENGINE
+#
+# Pipeline:
+#
+# Telegram Update
+#       ↓
+# GameContext
+#       ↓
+# Active Session
+#       ↓
+# Intent Detection
+#       ↓
+# Access / Membership
+#       ↓
+# Action
+#       ↓
+# Database / Redis
+#       ↓
+# GameResponse
+#
+# Rules:
+#   - Personal Gameplay = Text First
+#   - Public / Collective Gameplay = Text + Optional Buttons
+#   - Multi-City isolation
+#   - Redis-backed live Session
+#   - PostgreSQL-backed persistent state
+#
+# This file must not create:
+#   - Telegram Message
+#   - Bot
+#   - Dispatcher
+#   - InlineKeyboardButton
+#
 # ================================================================
 
 from __future__ import annotations
 
-import asyncio
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable, Optional
+
+from sqlalchemy import func, select
+
+from database import (
+    City,
+    CityMember,
+    User,
+    UserStats,
+    UserWallet,
+    Mission,
+    MissionProgress,
+    Event,
+    get_session as db_session,
+    get_game_session as redis_get_session,
+    set_game_session as redis_set_session,
+    clear_game_session as redis_clear_session,
+    get_intent_context,
+    set_intent_context,
+    clear_intent_context,
+    is_on_cooldown,
+    set_cooldown,
+    distributed_lock,
+    get_city_member,
+    get_city_by_chat,
+    city_population,
+)
 
 
 # ================================================================
-# SECTION 1: ENUMS
+# 1. ENUMS
 # ================================================================
 
 class IntentType(str, Enum):
-    START         = "START"
-    HELP          = "HELP"
-    PROFILE       = "PROFILE"
-    CITY          = "CITY"
-    MISSIONS      = "MISSIONS"
-    WORK          = "WORK"
-    EXPLORE       = "EXPLORE"
-    MARKET        = "MARKET"
-    GUILD         = "GUILD"
-    RANK          = "RANK"
-    CONFIRM       = "CONFIRM"
-    CANCEL        = "CANCEL"
-    NUMERIC       = "NUMERIC"       # digit answer inside a session
-    NO_INTENT     = "NO_INTENT"     # normal group chat — ignore
+    START = "START"
+    HELP = "HELP"
+    PROFILE = "PROFILE"
+    CITY = "CITY"
+    MISSIONS = "MISSIONS"
+    WORK = "WORK"
+    EXPLORE = "EXPLORE"
+    MARKET = "MARKET"
+    GUILD = "GUILD"
+    RANK = "RANK"
+
+    CONFIRM = "CONFIRM"
+    CANCEL = "CANCEL"
+    NUMERIC = "NUMERIC"
+    NO_INTENT = "NO_INTENT"
 
 
 class SessionState(str, Enum):
-    IDLE                   = "IDLE"
-    WAITING_FOR_CHOICE     = "WAITING_FOR_CHOICE"
+    IDLE = "IDLE"
+    WAITING_FOR_CHOICE = "WAITING_FOR_CHOICE"
     WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
-    INPUT_REQUIRED         = "INPUT_REQUIRED"
-    MISSION_ACTIVE         = "MISSION_ACTIVE"
-    EXPLORATION_ACTIVE     = "EXPLORATION_ACTIVE"
-    COMPLETED              = "COMPLETED"
-    EXPIRED                = "EXPIRED"
+    INPUT_REQUIRED = "INPUT_REQUIRED"
+    MISSION_ACTIVE = "MISSION_ACTIVE"
+    EXPLORATION_ACTIVE = "EXPLORATION_ACTIVE"
+    COMPLETED = "COMPLETED"
+    EXPIRED = "EXPIRED"
 
 
 class ResponseType(str, Enum):
-    PERSONAL         = "PERSONAL"        # private to the user
-    PUBLIC           = "PUBLIC"          # broadcast to the group
-    PUBLIC_VOTE      = "PUBLIC_VOTE"     # collective interaction
-    PUBLIC_EVENT     = "PUBLIC_EVENT"    # living-world event
-    ERROR            = "ERROR"
-    SILENT           = "SILENT"          # do not reply at all
+    PERSONAL = "PERSONAL"
+    PUBLIC = "PUBLIC"
+    PUBLIC_VOTE = "PUBLIC_VOTE"
+    PUBLIC_EVENT = "PUBLIC_EVENT"
+    ERROR = "ERROR"
+    SILENT = "SILENT"
 
 
 class ActionStyle(str, Enum):
-    """Contract for handlers.py / Button Factory.  game.py never builds buttons."""
-    PRIMARY = "PRIMARY"   # view / continue / neutral choice
-    SUCCESS = "SUCCESS"   # join / confirm / start
-    DANGER  = "DANGER"    # cancel / leave / destructive
+    PRIMARY = "PRIMARY"
+    SUCCESS = "SUCCESS"
+    DANGER = "DANGER"
 
 
 class GameError(str, Enum):
-    INVALID_ACTION       = "INVALID_ACTION"
-    SESSION_EXPIRED      = "SESSION_EXPIRED"
-    NOT_MEMBER           = "NOT_MEMBER"
-    INSUFFICIENT_ENERGY  = "INSUFFICIENT_ENERGY"
-    INSUFFICIENT_FUNDS   = "INSUFFICIENT_FUNDS"
-    COOLDOWN             = "COOLDOWN"
-    RATE_LIMITED         = "RATE_LIMITED"
-    UNKNOWN_INTENT       = "UNKNOWN_INTENT"
-    INVALID_INPUT        = "INVALID_INPUT"
-    FEATURE_NOT_READY    = "FEATURE_NOT_READY"
+    INVALID_ACTION = "INVALID_ACTION"
+    SESSION_EXPIRED = "SESSION_EXPIRED"
+    NOT_MEMBER = "NOT_MEMBER"
+    INSUFFICIENT_ENERGY = "INSUFFICIENT_ENERGY"
+    INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"
+    COOLDOWN = "COOLDOWN"
+    RATE_LIMITED = "RATE_LIMITED"
+    UNKNOWN_INTENT = "UNKNOWN_INTENT"
+    INVALID_INPUT = "INVALID_INPUT"
+    FEATURE_NOT_READY = "FEATURE_NOT_READY"
+    CITY_NOT_FOUND = "CITY_NOT_FOUND"
+    USER_NOT_FOUND = "USER_NOT_FOUND"
 
 
 # ================================================================
-# SECTION 2: DATA CONTRACTS
+# 2. DATA CONTRACTS
 # ================================================================
 
 @dataclass
 class GameContext:
     """
-    Immutable snapshot of one incoming message.
-    Independent of aiogram / Telegram objects.
+    Telegram-independent game input.
     """
-    user_id:             int
-    city_id:             int
-    chat_id:             int
-    message_id:          int
-    text:                str
-    is_group:            bool              = True
-    is_private:          bool              = False
-    username:            str               = ""
-    reply_to_message_id: int | None        = None
-    session_id:          str | None        = None
-    timestamp:           float             = field(default_factory=time.time)
-    # Filled by normalizer — original preserved for debug
-    normalized_text:     str               = ""
-    raw_text:            str               = ""
+
+    user_id: int
+    city_id: int
+    chat_id: int
+    message_id: int
+    text: str
+
+    is_group: bool = True
+    is_private: bool = False
+
+    username: str = ""
+
+    reply_to_message_id: Optional[int] = None
+
+    session_id: Optional[str] = None
+
+    timestamp: float = field(
+        default_factory=time.time
+    )
+
+    normalized_text: str = ""
+
+    raw_text: str = ""
 
     def __post_init__(self) -> None:
+
         if not self.raw_text:
             self.raw_text = self.text
+
         if not self.normalized_text:
-            self.normalized_text = normalize_text(self.text)
+            self.normalized_text = normalize_text(
+                self.text
+            )
 
 
 @dataclass
 class ActionButton:
     """
-    Metadata for a single UI button.
-    handlers.py reads this and builds the real InlineKeyboardButton.
+    Button metadata only.
+
+    handlers.py creates the real Telegram Button.
     """
-    action:  str         # e.g. "VOTE_YES"
-    label:   str         # Persian label shown on button
-    style:   ActionStyle = ActionStyle.PRIMARY
-    payload: dict[str, Any] = field(default_factory=dict)
+
+    action: str
+
+    label: str
+
+    style: ActionStyle = ActionStyle.PRIMARY
+
+    payload: dict[str, Any] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
 class GameResponse:
     """
-    Everything handlers.py needs to render a reply.
-    No Telegram objects inside.
+    Telegram-independent response.
     """
-    text:            str                          = ""
-    response_type:   ResponseType                 = ResponseType.PERSONAL
-    public:          bool                         = False
-    edit_preferred:  bool                         = False
-    session_id:      str | None                   = None
-    state:           SessionState                 = SessionState.IDLE
-    # Action names — handlers.py maps these to buttons
-    actions:         list[ActionButton]           = field(default_factory=list)
-    requires_ui:     bool                         = False   # True → handlers MUST render buttons
-    metadata:        dict[str, Any]               = field(default_factory=dict)
-    error:           GameError | None             = None
-    notification:    str | None                   = None    # optional inline toast / log note
+
+    text: str = ""
+
+    response_type: ResponseType = (
+        ResponseType.PERSONAL
+    )
+
+    public: bool = False
+
+    edit_preferred: bool = False
+
+    session_id: Optional[str] = None
+
+    state: SessionState = SessionState.IDLE
+
+    actions: list[ActionButton] = field(
+        default_factory=list
+    )
+
+    requires_ui: bool = False
+
+    metadata: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    error: Optional[GameError] = None
+
+    notification: Optional[str] = None
 
     @property
     def is_silent(self) -> bool:
-        return self.response_type == ResponseType.SILENT
+        return (
+            self.response_type
+            == ResponseType.SILENT
+        )
 
 
 # ================================================================
-# SECTION 3: TEXT NORMALIZATION
+# 3. TEXT NORMALIZATION
 # ================================================================
 
-# Arabic/Urdu variants → Persian canonical
-_CHAR_MAP: dict[str, str] = {
+_CHAR_MAP = {
     "ي": "ی",
     "ى": "ی",
     "ك": "ک",
-    "\u200c": " ",   # ZWNJ → space  (assists alias matching)
-    "\u200b": "",    # ZWS  → drop
-    "\u200f": "",    # RLM  → drop
-    "\u200e": "",    # LRM  → drop
+    "\u200c": " ",
+    "\u200b": "",
+    "\u200f": "",
+    "\u200e": "",
 }
 
-_MULTI_SPACE = re.compile(r" {2,}")
-_PUNCTUATION = re.compile(r"[!؟?.,،؛;:\-]+$")   # trailing punctuation only
+_MULTI_SPACE = re.compile(r"\s+")
+
+_TRAILING_PUNCTUATION = re.compile(
+    r"[!؟?.,،؛;:]+$"
+)
+
+_NUMERIC_RE = re.compile(
+    r"^[۰-۹0-9]+$"
+)
 
 
 def normalize_text(text: str) -> str:
     """
-    Normalize Persian input for intent matching.
-    Original is always preserved in GameContext.raw_text.
+    Normalize Persian text without destroying original input.
     """
-    t = text.strip().lower()
-    for src, dst in _CHAR_MAP.items():
-        t = t.replace(src, dst)
-    t = _PUNCTUATION.sub("", t).strip()
-    t = _MULTI_SPACE.sub(" ", t)
-    return t
+
+    if not text:
+        return ""
+
+    value = text.strip().lower()
+
+    for source, target in _CHAR_MAP.items():
+        value = value.replace(
+            source,
+            target,
+        )
+
+    value = _TRAILING_PUNCTUATION.sub(
+        "",
+        value,
+    )
+
+    value = _MULTI_SPACE.sub(
+        " ",
+        value,
+    )
+
+    return value.strip()
+
+
+def normalize_digits(text: str) -> str:
+    """
+    Convert Persian digits to English digits.
+    """
+
+    mapping = str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹",
+        "0123456789",
+    )
+
+    return text.translate(mapping)
 
 
 # ================================================================
-# SECTION 4: INTENT REGISTRY
+# 4. INTENT REGISTRY
 # ================================================================
 
-# Each entry: (IntentType, [aliases])
-# Matching order: exact → alias → pattern → NO_INTENT
-_INTENT_REGISTRY: list[tuple[IntentType, list[str]]] = [
-    (IntentType.START, [
-        "/start", "start", "شروع",
-    ]),
-    (IntentType.HELP, [
-        "/help", "راهنما", "کمک", "چطور بازی کنم", "help",
-    ]),
-    (IntentType.PROFILE, [
-        "پروفایل", "وضعیت من", "اطلاعات من", "من کی هستم",
-        "مشخصات من", "profile",
-    ]),
-    (IntentType.CITY, [
-        "شهر", "شهر ما", "وضعیت شهر", "اوضاع شهر", "شهرمون", "city",
-    ]),
-    (IntentType.MISSIONS, [
-        "مأموریت", "ماموریت", "مأموریت ها", "ماموریت ها",
-        "ماموریت هام", "ماموریت هام", "چه مأموریتی دارم",
-        "مأموریت های امروز", "missions", "mission",
-    ]),
-    (IntentType.WORK, [
-        "کار", "کار امروز", "کار کنم", "چه کاری انجام بدم",
-        "کار کردن", "work",
-    ]),
-    (IntentType.EXPLORE, [
-        "اکتشاف", "کاوش", "بگردیم", "منطقه جدید", "جستجو", "explore",
-    ]),
-    (IntentType.MARKET, [
-        "بازار", "بازار امروز", "قیمت ها", "قیمت بازار", "market",
-    ]),
-    (IntentType.GUILD, [
-        "گیلد", "guild", "گروه بازی",
-    ]),
-    (IntentType.RANK, [
-        "رتبه", "رتبه بندی", "نفرات برتر", "rank",
-    ]),
-    (IntentType.CONFIRM, [
-        "بله", "آره", "باشه", "تأیید", "اوکی", "ok", "yes", "بلی",
-    ]),
-    (IntentType.CANCEL, [
-        "نه", "خیر", "لغو", "انصراف", "بی خیال", "no",
-    ]),
-]
+INTENT_ALIASES: dict[
+    IntentType,
+    tuple[str, ...],
+] = {
+    IntentType.START: (
+        "/start",
+        "start",
+        "شروع",
+    ),
 
-# Build fast lookup: normalized alias → IntentType
+    IntentType.HELP: (
+        "/help",
+        "help",
+        "راهنما",
+        "کمک",
+        "چطور بازی کنم",
+        "چطور شروع کنم",
+    ),
+
+    IntentType.PROFILE: (
+        "پروفایل",
+        "وضعیت من",
+        "اطلاعات من",
+        "من کی هستم",
+        "مشخصات من",
+        "profile",
+    ),
+
+    IntentType.CITY: (
+        "شهر",
+        "شهر ما",
+        "شهرمون",
+        "وضعیت شهر",
+        "اوضاع شهر",
+        "city",
+    ),
+
+    IntentType.MISSIONS: (
+        "مأموریت",
+        "ماموریت",
+        "مأموریت ها",
+        "ماموریت ها",
+        "مأموریت هام",
+        "ماموریت هام",
+        "مأموریت‌هام",
+        "ماموریت‌هام",
+        "چه مأموریتی دارم",
+        "چه ماموریتی دارم",
+        "مأموریت های امروز",
+        "ماموریت های امروز",
+        "mission",
+        "missions",
+    ),
+
+    IntentType.WORK: (
+        "کار",
+        "کار امروز",
+        "کار کنم",
+        "چه کاری انجام بدم",
+        "کار کردن",
+        "work",
+    ),
+
+    IntentType.EXPLORE: (
+        "اکتشاف",
+        "کاوش",
+        "بگردیم",
+        "منطقه جدید",
+        "جستجو",
+        "explore",
+    ),
+
+    IntentType.MARKET: (
+        "بازار",
+        "بازار امروز",
+        "قیمت ها",
+        "قیمت‌های بازار",
+        "قیمت بازار",
+        "market",
+    ),
+
+    IntentType.GUILD: (
+        "گیلد",
+        "guild",
+        "گروه بازی",
+    ),
+
+    IntentType.RANK: (
+        "رتبه",
+        "رتبه بندی",
+        "رتبه‌بندی",
+        "نفرات برتر",
+        "rank",
+    ),
+
+    IntentType.CONFIRM: (
+        "بله",
+        "بلی",
+        "آره",
+        "باشه",
+        "تأیید",
+        "تایید",
+        "اوکی",
+        "ok",
+        "yes",
+    ),
+
+    IntentType.CANCEL: (
+        "نه",
+        "خیر",
+        "لغو",
+        "انصراف",
+        "بی خیال",
+        "بی‌خیال",
+        "no",
+    ),
+}
+
+
 _ALIAS_MAP: dict[str, IntentType] = {}
-for _intent, _aliases in _INTENT_REGISTRY:
-    for _alias in _aliases:
-        _ALIAS_MAP[normalize_text(_alias)] = _intent
 
-_NUMERIC_RE = re.compile(r"^[۰-۹0-9]+$")
+for intent, aliases in INTENT_ALIASES.items():
+
+    for alias in aliases:
+
+        _ALIAS_MAP[
+            normalize_text(alias)
+        ] = intent
 
 
-def detect_intent(normalized: str) -> IntentType:
+def detect_intent(
+    normalized: str,
+) -> IntentType:
     """
-    Rule-first intent detection.  No LLM involved.
-    Pipeline: exact → alias → numeric → NO_INTENT
+    Rule-first intent detection.
     """
-    if normalized in _ALIAS_MAP:
-        return _ALIAS_MAP[normalized]
-    if _NUMERIC_RE.match(normalized):
+
+    normalized = normalize_text(
+        normalized
+    )
+
+    exact = _ALIAS_MAP.get(
+        normalized
+    )
+
+    if exact is not None:
+        return exact
+
+    if _NUMERIC_RE.fullmatch(
+        normalized
+    ):
         return IntentType.NUMERIC
+
     return IntentType.NO_INTENT
 
 
 # ================================================================
-# SECTION 5: SESSION MANAGER
+# 5. ACCESS RULES
 # ================================================================
 
-# In production, replace _session_store with async Redis calls.
-# Redis key pattern: echo:session:{user_id}:{city_id}
-_session_store: dict[str, dict[str, Any]] = {}
-_session_locks: dict[str, asyncio.Lock] = {}
-
-SESSION_TTL = 300  # seconds
-
-
-def _session_key(user_id: int, city_id: int) -> str:
-    return f"echo:session:{user_id}:{city_id}"
+@dataclass(frozen=True)
+class AccessRule:
+    allow_private: bool
+    allow_group: bool
+    requires_member: bool
 
 
-def _get_lock(key: str) -> asyncio.Lock:
-    if key not in _session_locks:
-        _session_locks[key] = asyncio.Lock()
-    return _session_locks[key]
+ACCESS_RULES: dict[
+    IntentType,
+    AccessRule,
+] = {
+    IntentType.START:
+        AccessRule(
+            True,
+            True,
+            False,
+        ),
+
+    IntentType.HELP:
+        AccessRule(
+            True,
+            True,
+            False,
+        ),
+
+    IntentType.PROFILE:
+        AccessRule(
+            True,
+            True,
+            False,
+        ),
+
+    IntentType.CITY:
+        AccessRule(
+            False,
+            True,
+            True,
+        ),
+
+    IntentType.MISSIONS:
+        AccessRule(
+            False,
+            True,
+            True,
+        ),
+
+    IntentType.WORK:
+        AccessRule(
+            False,
+            True,
+            True,
+        ),
+
+    IntentType.EXPLORE:
+        AccessRule(
+            False,
+            True,
+            True,
+        ),
+
+    IntentType.MARKET:
+        AccessRule(
+            False,
+            True,
+            True,
+        ),
+
+    IntentType.GUILD:
+        AccessRule(
+            False,
+            True,
+            True,
+        ),
+
+    IntentType.RANK:
+        AccessRule(
+            False,
+            True,
+            True,
+        ),
+}
 
 
-async def get_session(user_id: int, city_id: int) -> dict[str, Any] | None:
-    key = _session_key(user_id, city_id)
-    session = _session_store.get(key)
-    if session is None:
+def check_access(
+    intent: IntentType,
+    context: GameContext,
+) -> Optional[GameError]:
+
+    rule = ACCESS_RULES.get(
+        intent
+    )
+
+    if rule is None:
         return None
-    if time.time() - session["updated_at"] > SESSION_TTL:
-        await expire_session(user_id, city_id)
+
+    if (
+        context.is_private
+        and not rule.allow_private
+    ):
+        return GameError.INVALID_ACTION
+
+    if (
+        context.is_group
+        and not rule.allow_group
+    ):
+        return GameError.INVALID_ACTION
+
+    return None
+
+
+# ================================================================
+# 6. DATABASE CONTEXT HELPERS
+# ================================================================
+
+async def ensure_user(
+    context: GameContext,
+) -> Optional[User]:
+
+    async with db_session() as session:
+
+        result = await session.execute(
+            select(User).where(
+                User.id
+                == context.user_id
+            )
+        )
+
+        return result.scalar_one_or_none()
+
+
+async def get_city(
+    context: GameContext,
+) -> Optional[City]:
+
+    async with db_session() as session:
+
+        result = await session.execute(
+            select(City).where(
+                City.id
+                == context.city_id
+            )
+        )
+
+        return result.scalar_one_or_none()
+
+
+async def is_city_member(
+    user_id: int,
+    city_id: int,
+) -> bool:
+
+    async with db_session() as session:
+
+        member = await get_city_member(
+            session,
+            city_id,
+            user_id,
+        )
+
+        return bool(
+            member
+            and member.is_active
+        )
+
+
+async def get_user_city_data(
+    user_id: int,
+    city_id: int,
+) -> Optional[
+    tuple[
+        User,
+        UserStats,
+        City,
+        CityMember,
+        UserWallet,
+    ]
+]:
+
+    async with db_session() as session:
+
+        user_result = await session.execute(
+            select(User).where(
+                User.id
+                == user_id
+            )
+        )
+
+        user = (
+            user_result
+            .scalar_one_or_none()
+        )
+
+        if user is None:
+            return None
+
+        stats_result = await session.execute(
+            select(UserStats).where(
+                UserStats.user_id
+                == user_id
+            )
+        )
+
+        stats = (
+            stats_result
+            .scalar_one_or_none()
+        )
+
+        if stats is None:
+            return None
+
+        city_result = await session.execute(
+            select(City).where(
+                City.id
+                == city_id
+            )
+        )
+
+        city = (
+            city_result
+            .scalar_one_or_none()
+        )
+
+        if city is None:
+            return None
+
+        member_result = await session.execute(
+            select(CityMember).where(
+                CityMember.city_id
+                == city_id,
+                CityMember.user_id
+                == user_id,
+                CityMember.is_active.is_(True),
+            )
+        )
+
+        member = (
+            member_result
+            .scalar_one_or_none()
+        )
+
+        if member is None:
+            return None
+
+        wallet_result = await session.execute(
+            select(UserWallet).where(
+                UserWallet.city_id
+                == city_id,
+                UserWallet.user_id
+                == user_id,
+            )
+        )
+
+        wallet = (
+            wallet_result
+            .scalar_one_or_none()
+        )
+
+        if wallet is None:
+            return None
+
+        return (
+            user,
+            stats,
+            city,
+            member,
+            wallet,
+        )
+
+
+# ================================================================
+# 7. RESPONSE HELPERS
+# ================================================================
+
+_ERROR_TEXT = {
+    GameError.INVALID_ACTION:
+        "این کار الان امکان‌پذیر نیست.",
+
+    GameError.SESSION_EXPIRED:
+        "این مرحله منقضی شده. برای شروع دوباره، دوباره درخواستت را بفرست.",
+
+    GameError.NOT_MEMBER:
+        "اول باید وارد این City شوی.",
+
+    GameError.INSUFFICIENT_ENERGY:
+        "⚡ انرژی کافی نداری.",
+
+    GameError.INSUFFICIENT_FUNDS:
+        "💰 موجودی کافی نداری.",
+
+    GameError.COOLDOWN:
+        "⏳ هنوز باید کمی صبر کنی.",
+
+    GameError.RATE_LIMITED:
+        "⏳ کمی آرام‌تر پیش برو و دوباره امتحان کن.",
+
+    GameError.UNKNOWN_INTENT:
+        "متوجه درخواستت نشدم. «راهنما» را بفرست.",
+
+    GameError.INVALID_INPUT:
+        "این گزینه درست نیست. یکی از گزینه‌های نمایش‌داده‌شده را بفرست.",
+
+    GameError.FEATURE_NOT_READY:
+        "این بخش هنوز آماده نشده.",
+
+    GameError.CITY_NOT_FOUND:
+        "این City پیدا نشد.",
+
+    GameError.USER_NOT_FOUND:
+        "حساب کاربری تو پیدا نشد.",
+}
+
+
+def error_response(
+    error: GameError,
+    *,
+    state: SessionState = SessionState.IDLE,
+    session_id: Optional[str] = None,
+) -> GameResponse:
+
+    return GameResponse(
+        text=_ERROR_TEXT.get(
+            error,
+            "یک مشکل پیش آمد.",
+        ),
+        response_type=ResponseType.ERROR,
+        public=False,
+        state=state,
+        session_id=session_id,
+        error=error,
+    )
+
+
+# ================================================================
+# 8. SESSION HELPERS
+# ================================================================
+
+async def get_active_session(
+    user_id: int,
+    city_id: int,
+) -> Optional[dict[str, Any]]:
+
+    data = await redis_get_session(
+        user_id,
+        city_id,
+    )
+
+    if not data:
         return None
-    return session
+
+    return data
 
 
 async def create_session(
     user_id: int,
     city_id: int,
     state: SessionState,
-    data: dict[str, Any] | None = None,
+    payload: Optional[
+        dict[str, Any]
+    ] = None,
+    ttl_seconds: int = 300,
 ) -> dict[str, Any]:
-    key = _session_key(user_id, city_id)
-    async with _get_lock(key):
-        # Idempotency: if session already exists (concurrent message), return it
-        existing = _session_store.get(key)
-        if existing and time.time() - existing["updated_at"] <= SESSION_TTL:
-            return existing
-        session = {
-            "session_id": str(uuid.uuid4()),
-            "user_id":    user_id,
-            "city_id":    city_id,
-            "state":      state,
-            "data":       data or {},
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
-        _session_store[key] = session
-        return session
+
+    existing = await get_active_session(
+        user_id,
+        city_id,
+    )
+
+    if existing:
+        return existing
+
+    session_id = str(
+        uuid.uuid4()
+    )
+
+    session_data = {
+        "session_id": session_id,
+        "state": state.value,
+        "payload": payload or {},
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+
+    await redis_set_session(
+        user_id,
+        city_id,
+        state.value,
+        payload=session_data["payload"],
+        ttl_seconds=ttl_seconds,
+    )
+
+    return session_data
 
 
 async def update_session(
     user_id: int,
     city_id: int,
     state: SessionState,
-    data: dict[str, Any] | None = None,
+    payload: Optional[
+        dict[str, Any]
+    ] = None,
+    ttl_seconds: int = 300,
 ) -> None:
-    key = _session_key(user_id, city_id)
-    async with _get_lock(key):
-        session = _session_store.get(key)
-        if session:
-            session["state"] = state
-            session["updated_at"] = time.time()
-            if data is not None:
-                session["data"].update(data)
+
+    current = await get_active_session(
+        user_id,
+        city_id,
+    )
+
+    merged_payload = {}
+
+    session_id = str(
+        uuid.uuid4()
+    )
+
+    if current:
+
+        session_id = current.get(
+            "session_id",
+            session_id,
+        )
+
+        merged_payload.update(
+            current.get(
+                "payload",
+                {},
+            )
+        )
+
+    if payload:
+        merged_payload.update(
+            payload
+        )
+
+    merged_payload["session_id"] = (
+        session_id
+    )
+
+    await redis_set_session(
+        user_id,
+        city_id,
+        state.value,
+        payload=merged_payload,
+        ttl_seconds=ttl_seconds,
+    )
 
 
-async def expire_session(user_id: int, city_id: int) -> None:
-    key = _session_key(user_id, city_id)
-    async with _get_lock(key):
-        session = _session_store.get(key)
-        if session:
-            session["state"] = SessionState.EXPIRED
-            _session_store.pop(key, None)
+async def expire_session(
+    user_id: int,
+    city_id: int,
+) -> None:
+
+    await redis_clear_session(
+        user_id,
+        city_id,
+    )
+
+    await clear_intent_context(
+        user_id,
+        city_id,
+    )
 
 
 # ================================================================
-# SECTION 6: ACCESS RULES
+# 9. GAME ACTION REGISTRY
 # ================================================================
 
-@dataclass
-class _AccessRule:
-    allow_private:    bool
-    allow_group:      bool
-    requires_member:  bool
+ActionHandler = Callable[
+    [GameContext, Optional[dict[str, Any]]],
+    Awaitable[GameResponse],
+]
+
+_ACTIONS: dict[
+    IntentType,
+    ActionHandler,
+] = {}
 
 
-_ACCESS: dict[IntentType, _AccessRule] = {
-    IntentType.START:    _AccessRule(True,  True,  False),
-    IntentType.HELP:     _AccessRule(True,  True,  False),
-    IntentType.PROFILE:  _AccessRule(True,  True,  True),
-    IntentType.CITY:     _AccessRule(False, True,  True),
-    IntentType.MISSIONS: _AccessRule(False, True,  True),
-    IntentType.WORK:     _AccessRule(False, True,  True),
-    IntentType.EXPLORE:  _AccessRule(False, True,  True),
-    IntentType.MARKET:   _AccessRule(False, True,  True),
-    IntentType.GUILD:    _AccessRule(False, True,  True),
-    IntentType.RANK:     _AccessRule(False, True,  True),
-}
+def register_action(
+    intent: IntentType,
+) -> Callable[
+    [ActionHandler],
+    ActionHandler,
+]:
 
+    def decorator(
+        function: ActionHandler,
+    ) -> ActionHandler:
 
-def _check_access(intent: IntentType, ctx: GameContext) -> GameError | None:
-    rule = _ACCESS.get(intent)
-    if rule is None:
-        return None
-    if ctx.is_private and not rule.allow_private:
-        return GameError.INVALID_ACTION
-    if ctx.is_group and not rule.allow_group:
-        return GameError.INVALID_ACTION
-    return None
+        _ACTIONS[intent] = function
 
+        return function
 
-# ================================================================
-# SECTION 7: ACTION HANDLERS
-# ================================================================
-
-# Signature: async (ctx, session | None) → GameResponse
-ActionHandler = Callable[[GameContext, dict | None], Awaitable[GameResponse]]
-_ACTION_REGISTRY: dict[IntentType, ActionHandler] = {}
-
-
-def register_action(intent: IntentType) -> Callable[[ActionHandler], ActionHandler]:
-    def decorator(fn: ActionHandler) -> ActionHandler:
-        _ACTION_REGISTRY[intent] = fn
-        return fn
     return decorator
 
 
-# ----------------------------------------------------------------
-# START
-# ----------------------------------------------------------------
+# ================================================================
+# 10. START
+# ================================================================
+
 @register_action(IntentType.START)
-async def _handle_start(ctx: GameContext, _session: dict | None) -> GameResponse:
-    return GameResponse(
-        text=(
-            "⚡ به ECHO خوش اومدی!\n\n"
-            "ECHO یک بازی گروهی متنی‌ه.\n"
-            "توی گروه‌های Telegram بازی می‌کنی و هر گروه یک City داره.\n\n"
-            "برای شروع، «راهنما» بفرست."
-        ),
-        response_type=ResponseType.PERSONAL,
-        state=SessionState.IDLE,
-    )
-
-
-# ----------------------------------------------------------------
-# HELP
-# ----------------------------------------------------------------
-@register_action(IntentType.HELP)
-async def _handle_help(ctx: GameContext, _session: dict | None) -> GameResponse:
-    return GameResponse(
-        text=(
-            "📖 راهنمای ECHO\n\n"
-            "چیزایی که می‌تونی بفرستی:\n"
-            "• «مأموریت» — مأموریت‌های فعال\n"
-            "• «کار» — انجام کار روزانه\n"
-            "• «اکتشاف» — کشف مناطق جدید\n"
-            "• «پروفایل» — وضعیت شخصی‌ات\n"
-            "• «شهر» — وضعیت City\n"
-            "• «بازار» — قیمت‌ها و بازار\n"
-            "• «گیلد» — گروه بازی‌ات\n"
-            "• «رتبه» — نفرات برتر\n\n"
-            "نیازی به دستوری خاص نیست — فقط بنویس."
-        ),
-        response_type=ResponseType.PERSONAL,
-        state=SessionState.IDLE,
-    )
-
-
-# ----------------------------------------------------------------
-# PROFILE
-# ----------------------------------------------------------------
-@register_action(IntentType.PROFILE)
-async def _handle_profile(ctx: GameContext, _session: dict | None) -> GameResponse:
-    # Real data will come from database.py
-    # Placeholder shows contract: Global vs City separation
-    profile_data: dict[str, Any] = {
-        "global": {
-            "level":             1,
-            "xp":                0,
-            "fame":              0,
-            "global_reputation": 0,
-        },
-        "city": {
-            "energy":            100,
-            "city_reputation":   0,
-            "wallet":            0,
-            "contribution":      0,
-            "role":              "شهروند",
-        },
-    }
-    g = profile_data["global"]
-    c = profile_data["city"]
-    text = (
-        f"👤 پروفایل @{ctx.username or ctx.user_id}\n\n"
-        f"🌍 جهانی\n"
-        f"  سطح: {g['level']}  |  XP: {g['xp']}  |  شهرت: {g['fame']}\n\n"
-        f"🏙 این City\n"
-        f"  ⚡ انرژی: {c['energy']}  |  💰 کیف‌پول: {c['wallet']}\n"
-        f"  نقش: {c['role']}  |  مشارکت: {c['contribution']}"
-    )
-    return GameResponse(
-        text=text,
-        response_type=ResponseType.PERSONAL,
-        public=False,
-        state=SessionState.IDLE,
-        metadata={"profile": profile_data},
-    )
-
-
-# ----------------------------------------------------------------
-# CITY
-# ----------------------------------------------------------------
-@register_action(IntentType.CITY)
-async def _handle_city(ctx: GameContext, _session: dict | None) -> GameResponse:
-    city_data: dict[str, Any] = {
-        "name":          "City نامشخص",
-        "level":         1,
-        "population":    0,
-        "treasury":      0,
-        "city_code":     f"C{ctx.city_id}",
-        "activity":      "عادی",
-    }
-    d = city_data
-    text = (
-        f"🏙 {d['name']}  [{d['city_code']}]\n\n"
-        f"  سطح: {d['level']}  |  جمعیت: {d['population']}\n"
-        f"  خزانه: {d['treasury']}  |  فعالیت: {d['activity']}"
-    )
-    return GameResponse(
-        text=text,
-        response_type=ResponseType.PERSONAL,
-        public=False,
-        state=SessionState.IDLE,
-        metadata={"city": city_data},
-    )
-
-
-# ----------------------------------------------------------------
-# MISSIONS
-# ----------------------------------------------------------------
-@register_action(IntentType.MISSIONS)
-async def _handle_missions(ctx: GameContext, _session: dict | None) -> GameResponse:
-    # Foundation stub — Mission Engine built in a later Prompt
-    missions = [
-        {"id": 1, "title": "دو فعالیت انجام بده"},
-        {"id": 2, "title": "یک منطقه را بررسی کن"},
-        {"id": 3, "title": "۵۰۰۰ پول به دست بیار"},
-    ]
-    lines = "\n".join(f"{m['id']}. {m['title']}" for m in missions)
-    session = await create_session(
-        ctx.user_id, ctx.city_id,
-        SessionState.WAITING_FOR_CHOICE,
-        {"action": "mission_select", "missions": missions},
-    )
-    return GameResponse(
-        text=(
-            f"🎯 سه مأموریت برای امروز داری:\n\n{lines}\n\n"
-            "برای انتخاب، شماره بفرست."
-        ),
-        response_type=ResponseType.PERSONAL,
-        public=False,
-        edit_preferred=False,
-        session_id=session["session_id"],
-        state=SessionState.WAITING_FOR_CHOICE,
-        metadata={"missions": missions},
-    )
-
-
-# ----------------------------------------------------------------
-# WORK
-# ----------------------------------------------------------------
-@register_action(IntentType.WORK)
-async def _handle_work(ctx: GameContext, _session: dict | None) -> GameResponse:
-    return GameResponse(
-        text=(
-            "⚙️ سیستم کار هنوز فعال نشده.\n"
-            "به زودی می‌تونی کارهای روزانه انجام بدی."
-        ),
-        response_type=ResponseType.PERSONAL,
-        state=SessionState.IDLE,
-        error=GameError.FEATURE_NOT_READY,
-    )
-
-
-# ----------------------------------------------------------------
-# EXPLORE
-# ----------------------------------------------------------------
-@register_action(IntentType.EXPLORE)
-async def _handle_explore(ctx: GameContext, _session: dict | None) -> GameResponse:
-    return GameResponse(
-        text=(
-            "🗺 سیستم اکتشاف هنوز فعال نشده.\n"
-            "به زودی می‌تونی مناطق جدید پیدا کنی."
-        ),
-        response_type=ResponseType.PERSONAL,
-        state=SessionState.IDLE,
-        error=GameError.FEATURE_NOT_READY,
-    )
-
-
-# ----------------------------------------------------------------
-# MARKET
-# ----------------------------------------------------------------
-@register_action(IntentType.MARKET)
-async def _handle_market(ctx: GameContext, _session: dict | None) -> GameResponse:
-    return GameResponse(
-        text=(
-            "🏪 بازار هنوز فعال نشده.\n"
-            "به زودی می‌تونی خرید و فروش کنی."
-        ),
-        response_type=ResponseType.PERSONAL,
-        state=SessionState.IDLE,
-        error=GameError.FEATURE_NOT_READY,
-    )
-
-
-# ----------------------------------------------------------------
-# GUILD
-# ----------------------------------------------------------------
-@register_action(IntentType.GUILD)
-async def _handle_guild(ctx: GameContext, _session: dict | None) -> GameResponse:
-    return GameResponse(
-        text=(
-            "⚔️ سیستم گیلد هنوز فعال نشده.\n"
-            "به زودی می‌تونی گیلد تشکیل بدی یا بهش بپیوندی."
-        ),
-        response_type=ResponseType.PERSONAL,
-        state=SessionState.IDLE,
-        error=GameError.FEATURE_NOT_READY,
-    )
-
-
-# ----------------------------------------------------------------
-# RANK
-# ----------------------------------------------------------------
-@register_action(IntentType.RANK)
-async def _handle_rank(ctx: GameContext, _session: dict | None) -> GameResponse:
-    return GameResponse(
-        text=(
-            "🏆 رتبه‌بندی هنوز فعال نشده.\n"
-            "به زودی می‌تونی نفرات برتر رو ببینی."
-        ),
-        response_type=ResponseType.PERSONAL,
-        state=SessionState.IDLE,
-        error=GameError.FEATURE_NOT_READY,
-    )
-
-
-# ================================================================
-# SECTION 8: SESSION CONTINUATION ENGINE
-# ================================================================
-
-async def _handle_session_input(
-    ctx: GameContext,
-    session: dict[str, Any],
+async def handle_start(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
 ) -> GameResponse:
-    """
-    Dispatch a message that belongs to an active session.
-    Dispatches to the correct sub-handler based on session state.
-    """
-    state = SessionState(session["state"])
-    norm = ctx.normalized_text
 
-    # ── WAITING_FOR_CHOICE ──────────────────────────────────────
-    if state == SessionState.WAITING_FOR_CHOICE:
-        action = session["data"].get("action")
+    return GameResponse(
+        text=(
+            "🌐 <b>ECHO</b>\n\n"
+            "ECHO یک بازی چندنفره متنی است که "
+            "داخل Groupهای Telegram اجرا می‌شود.\n\n"
+            "هر Group یک City است.\n"
+            "برای شروع، ECHO را به یک Group اضافه کن."
+        ),
+        response_type=ResponseType.PERSONAL,
+        state=SessionState.IDLE,
+    )
 
-        if action == "mission_select":
-            missions = session["data"].get("missions", [])
-            try:
-                choice = int(norm) if norm.isdigit() else int(
-                    "".join(c for c in norm if c.isdigit())
-                )
-            except (ValueError, TypeError):
-                return _error_response(GameError.INVALID_INPUT, ctx)
 
-            mission = next((m for m in missions if m["id"] == choice), None)
-            if not mission:
-                return GameResponse(
-                    text=(
-                        f"گزینه‌ای به شماره {choice} وجود نداره.\n"
-                        "یکی از شماره‌های نمایش داده شده رو بفرست."
-                    ),
-                    response_type=ResponseType.PERSONAL,
-                    state=state,
-                    session_id=session["session_id"],
-                )
+# ================================================================
+# 11. HELP
+# ================================================================
 
-            await update_session(
-                ctx.user_id, ctx.city_id,
-                SessionState.WAITING_FOR_CONFIRMATION,
-                {"selected_mission": mission},
-            )
-            return GameResponse(
-                text=(
-                    f"🎯 مأموریت انتخابی:\n«{mission['title']}»\n\n"
-                    "شروع می‌کنی؟  (بله / نه)"
-                ),
-                response_type=ResponseType.PERSONAL,
-                state=SessionState.WAITING_FOR_CONFIRMATION,
-                session_id=session["session_id"],
-            )
+@register_action(IntentType.HELP)
+async def handle_help(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
 
-        # Fallback for unknown choice action
-        return _error_response(GameError.INVALID_ACTION, ctx)
+    return GameResponse(
+        text=(
+            "📚 <b>راهنمای ECHO</b>\n\n"
+            "بازی اصلی داخل Group انجام می‌شود.\n\n"
+            "می‌توانی بنویسی:\n\n"
+            "🎯 «مأموریت»\n"
+            "برای دیدن مأموریت‌های فعال.\n\n"
+            "💼 «کار»\n"
+            "برای دیدن فرصت‌های کاری.\n\n"
+            "🧭 «اکتشاف»\n"
+            "برای بررسی مناطق جدید.\n\n"
+            "👤 «پروفایل»\n"
+            "برای دیدن وضعیت خودت.\n\n"
+            "🏙 «شهر»\n"
+            "برای دیدن وضعیت City.\n\n"
+            "📈 «بازار»\n"
+            "برای دیدن بازار.\n\n"
+            "⚔️ «گیلد»\n"
+            "برای بخش Guild.\n\n"
+            "🏆 «رتبه»\n"
+            "برای دیدن رتبه‌بندی.\n\n"
+            "در طول بازی لازم نیست Command خاصی حفظ کنی. "
+            "فقط کاری که می‌خواهی انجام دهی را بنویس."
+        ),
+        response_type=ResponseType.PERSONAL,
+    )
 
-    # ── WAITING_FOR_CONFIRMATION ─────────────────────────────────
-    if state == SessionState.WAITING_FOR_CONFIRMATION:
-        intent = detect_intent(norm)
 
-        if intent == IntentType.CONFIRM:
-            selected = session["data"].get("selected_mission")
-            await expire_session(ctx.user_id, ctx.city_id)
-            # Real mission start logic lives in mission.py (future Prompt)
-            return GameResponse(
-                text=(
-                    f"✅ مأموریت «{selected['title']}» شروع شد.\n"
-                    "موفق باشی!"
-                ),
-                response_type=ResponseType.PERSONAL,
-                state=SessionState.COMPLETED,
-            )
+# ================================================================
+# 12. PROFILE
+# ================================================================
 
-        if intent == IntentType.CANCEL:
-            await expire_session(ctx.user_id, ctx.city_id)
-            return GameResponse(
-                text="لغو شد. هر وقت خواستی دوباره «مأموریت» بفرست.",
-                response_type=ResponseType.PERSONAL,
-                state=SessionState.IDLE,
-            )
+@register_action(IntentType.PROFILE)
+async def handle_profile(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
 
-        return GameResponse(
-            text="«بله» یا «نه» بفرست.",
-            response_type=ResponseType.PERSONAL,
-            state=state,
-            session_id=session["session_id"],
+    data = await get_user_city_data(
+        context.user_id,
+        context.city_id,
+    )
+
+    if data is None:
+
+        user = await ensure_user(
+            context
         )
 
-    # ── INPUT_REQUIRED ───────────────────────────────────────────
-    if state == SessionState.INPUT_REQUIRED:
-        # Generic text collection — specific logic injected via session data
-        handler_name = session["data"].get("input_handler")
-        if handler_name:
-            # Future: route to registered input handlers
-            pass
-        return _error_response(GameError.INVALID_INPUT, ctx)
+        if user is None:
 
-    # ── Catch-all: unknown / expired state ───────────────────────
-    await expire_session(ctx.user_id, ctx.city_id)
-    return _error_response(GameError.SESSION_EXPIRED, ctx)
+            return error_response(
+                GameError.USER_NOT_FOUND
+            )
+
+        return error_response(
+            GameError.NOT_MEMBER
+        )
+
+    (
+        user,
+        stats,
+        city,
+        member,
+        wallet,
+    ) = data
+
+    name = (
+        f"@{user.username}"
+        if user.username
+        else user.nickname
+        or str(user.id)
+    )
+
+    role = {
+        "owner": "مالک City",
+        "admin": "مدیر City",
+        "member": "شهروند",
+    }.get(
+        member.role,
+        "شهروند",
+    )
+
+    text = (
+        f"👤 <b>{name}</b>\n\n"
+
+        f"🌍 <b>پیشرفت کلی</b>\n"
+        f"سطح: {stats.level}\n"
+        f"XP: {stats.xp:,}\n"
+        f"شهرت: {stats.fame:,}\n"
+        f"اعتبار جهانی: {stats.global_reputation:,}\n\n"
+
+        f"🏙 <b>{city.name}</b>\n"
+        f"⚡ انرژی: {member.energy}\n"
+        f"⭐ اعتبار City: {member.city_reputation:,}\n"
+        f"🤝 مشارکت: {member.contribution:,}\n"
+        f"💰 پول نقد: {wallet.cash:,}\n"
+        f"🏦 بانک: {wallet.bank:,}\n"
+        f"👤 نقش: {role}"
+    )
+
+    return GameResponse(
+        text=text,
+        response_type=ResponseType.PERSONAL,
+        metadata={
+            "user_id": user.id,
+            "city_id": city.id,
+            "global": {
+                "level": stats.level,
+                "xp": stats.xp,
+                "fame": stats.fame,
+                "global_reputation":
+                    stats.global_reputation,
+            },
+            "city": {
+                "energy": member.energy,
+                "city_reputation":
+                    member.city_reputation,
+                "contribution":
+                    member.contribution,
+                "cash": wallet.cash,
+                "bank": wallet.bank,
+            },
+        },
+    )
 
 
 # ================================================================
-# SECTION 9: PUBLIC EVENT FACTORY
+# 13. CITY
+# ================================================================
+
+@register_action(IntentType.CITY)
+async def handle_city(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
+
+    async with db_session() as session:
+
+        city_result = await session.execute(
+            select(City).where(
+                City.id
+                == context.city_id
+            )
+        )
+
+        city = (
+            city_result
+            .scalar_one_or_none()
+        )
+
+        if city is None:
+
+            return error_response(
+                GameError.CITY_NOT_FOUND
+            )
+
+        population = await city_population(
+            session,
+            city.id,
+        )
+
+    activity = (
+        "زیاد"
+        if population >= 50
+        else "متوسط"
+        if population >= 15
+        else "کم"
+    )
+
+    text = (
+        f"🏙 <b>{city.name}</b>\n\n"
+        f"⭐ سطح: {city.level}\n"
+        f"👥 جمعیت: {population}\n"
+        f"💰 خزانه: {city.treasury:,}\n"
+        f"🔥 فعالیت: {activity}\n"
+        f"🏷 کد City: {city.city_code or '-'}"
+    )
+
+    return GameResponse(
+        text=text,
+        response_type=ResponseType.PERSONAL,
+        metadata={
+            "city_id": city.id,
+            "population": population,
+            "activity": activity,
+        },
+    )
+
+
+# ================================================================
+# 14. MISSIONS
+# ================================================================
+
+async def get_available_missions(
+    user_id: int,
+    city_id: int,
+) -> list[dict[str, Any]]:
+
+    async with db_session() as session:
+
+        result = await session.execute(
+            select(Mission)
+            .where(
+                Mission.is_active.is_(True),
+                (
+                    (Mission.city_id == city_id)
+                    | (Mission.city_id.is_(None))
+                ),
+            )
+            .order_by(
+                Mission.difficulty.asc(),
+                Mission.id.asc(),
+            )
+            .limit(3)
+        )
+
+        missions = result.scalars().all()
+
+        if missions:
+            return [
+                {
+                    "id": mission.id,
+                    "title": mission.title,
+                    "description":
+                        mission.description or "",
+                    "difficulty":
+                        mission.difficulty,
+                    "reward_cash":
+                        mission.reward_cash,
+                    "reward_xp":
+                        mission.reward_xp,
+                    "energy_cost":
+                        mission.energy_cost,
+                }
+                for mission in missions
+            ]
+
+    # Foundation fallback.
+    return [
+        {
+            "id": 1,
+            "title": "دو فعالیت انجام بده",
+            "description":
+                "دو فعالیت بازی را کامل کن.",
+            "difficulty": 1,
+            "reward_cash": 3000,
+            "reward_xp": 150,
+            "energy_cost": 10,
+        },
+        {
+            "id": 2,
+            "title": "یک منطقه را بررسی کن",
+            "description":
+                "یک اکتشاف انجام بده.",
+            "difficulty": 2,
+            "reward_cash": 5000,
+            "reward_xp": 250,
+            "energy_cost": 15,
+        },
+        {
+            "id": 3,
+            "title": "۵۰۰۰ پول به دست بیاور",
+            "description":
+                "درآمد امروزت را به حد مشخص برسان.",
+            "difficulty": 2,
+            "reward_cash": 6000,
+            "reward_xp": 300,
+            "energy_cost": 0,
+        },
+    ]
+
+
+@register_action(IntentType.MISSIONS)
+async def handle_missions(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
+
+    missions = await get_available_missions(
+        context.user_id,
+        context.city_id,
+    )
+
+    lines = []
+
+    for index, mission in enumerate(
+        missions,
+        start=1,
+    ):
+
+        lines.append(
+            f"{index}. {mission['title']}"
+        )
+
+    async with distributed_lock(
+        f"session:{context.user_id}:{context.city_id}",
+        ttl_seconds=5,
+        wait_seconds=1,
+    ) as acquired:
+
+        if not acquired:
+
+            return error_response(
+                GameError.COOLDOWN
+            )
+
+        session = await create_session(
+            context.user_id,
+            context.city_id,
+            SessionState.WAITING_FOR_CHOICE,
+            {
+                "action":
+                    "mission_select",
+
+                "missions":
+                    missions,
+            },
+            ttl_seconds=300,
+        )
+
+    await set_intent_context(
+        context.user_id,
+        context.city_id,
+        IntentType.MISSIONS.value,
+        SessionState.WAITING_FOR_CHOICE.value,
+        {
+            "session_id":
+                session["session_id"]
+        },
+        ttl_seconds=300,
+    )
+
+    text = (
+        "🎯 <b>مأموریت‌های امروز</b>\n\n"
+        + "\n".join(lines)
+        + "\n\n"
+        "برای دیدن جزئیات، شماره مأموریت را بفرست."
+    )
+
+    return GameResponse(
+        text=text,
+        response_type=ResponseType.PERSONAL,
+        state=SessionState.WAITING_FOR_CHOICE,
+        session_id=session[
+            "session_id"
+        ],
+        metadata={
+            "missions": missions
+        },
+    )
+
+
+# ================================================================
+# 15. WORK
+# ================================================================
+
+@register_action(IntentType.WORK)
+async def handle_work(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
+
+    return GameResponse(
+        text=(
+            "💼 <b>بخش کار</b>\n\n"
+            "سیستم اصلی کار هنوز در حال آماده‌سازی است.\n\n"
+            "در نسخه کامل، چند فرصت با درآمد و ریسک متفاوت "
+            "در اختیارت قرار می‌گیرد."
+        ),
+        response_type=ResponseType.PERSONAL,
+        error=GameError.FEATURE_NOT_READY,
+    )
+
+
+# ================================================================
+# 16. EXPLORE
+# ================================================================
+
+@register_action(IntentType.EXPLORE)
+async def handle_explore(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
+
+    return GameResponse(
+        text=(
+            "🧭 <b>اکتشاف</b>\n\n"
+            "سیستم اصلی اکتشاف هنوز در حال آماده‌سازی است.\n\n"
+            "در نسخه کامل می‌توانی مناطق جدید را بررسی کنی، "
+            "Discovery پیدا کنی و با ریسک‌های مختلف روبه‌رو شوی."
+        ),
+        response_type=ResponseType.PERSONAL,
+        error=GameError.FEATURE_NOT_READY,
+    )
+
+
+# ================================================================
+# 17. MARKET
+# ================================================================
+
+@register_action(IntentType.MARKET)
+async def handle_market(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
+
+    return GameResponse(
+        text=(
+            "📈 <b>بازار</b>\n\n"
+            "بازار هنوز فعال نشده است.\n\n"
+            "در نسخه کامل قیمت‌ها و فرصت‌های معامله "
+            "بر اساس وضعیت اقتصاد City تغییر می‌کنند."
+        ),
+        response_type=ResponseType.PERSONAL,
+        error=GameError.FEATURE_NOT_READY,
+    )
+
+
+# ================================================================
+# 18. GUILD
+# ================================================================
+
+@register_action(IntentType.GUILD)
+async def handle_guild(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
+
+    return GameResponse(
+        text=(
+            "⚔️ <b>Guild</b>\n\n"
+            "سیستم Guild هنوز فعال نشده است.\n\n"
+            "بعداً می‌توانی Guild بسازی، عضو Guild شوی "
+            "و در رقابت‌های گروهی شرکت کنی."
+        ),
+        response_type=ResponseType.PERSONAL,
+        error=GameError.FEATURE_NOT_READY,
+    )
+
+
+# ================================================================
+# 19. RANK
+# ================================================================
+
+@register_action(IntentType.RANK)
+async def handle_rank(
+    context: GameContext,
+    _session: Optional[
+        dict[str, Any]
+    ],
+) -> GameResponse:
+
+    async with db_session() as session:
+
+        result = await session.execute(
+            select(
+                User,
+                UserStats,
+                UserWallet,
+            )
+            .join(
+                UserStats,
+                UserStats.user_id
+                == User.id,
+            )
+            .join(
+                UserWallet,
+                UserWallet.user_id
+                == User.id,
+            )
+            .where(
+                UserWallet.city_id
+                == context.city_id,
+            )
+            .order_by(
+                UserStats.level.desc(),
+                UserStats.xp.desc(),
+            )
+            .limit(10)
+        )
+
+        rows = result.all()
+
+    if not rows:
+
+        return GameResponse(
+            text=(
+                "🏆 هنوز کسی برای رتبه‌بندی ثبت نشده است."
+            ),
+            response_type=ResponseType.PERSONAL,
+        )
+
+    medals = (
+        "🥇",
+        "🥈",
+        "🥉",
+    )
+
+    lines = []
+
+    for index, (
+        user,
+        stats,
+        wallet,
+    ) in enumerate(rows):
+
+        medal = (
+            medals[index]
+            if index < 3
+            else f"{index + 1}."
+        )
+
+        name = (
+            f"@{user.username}"
+            if user.username
+            else user.nickname
+            or str(user.id)
+        )
+
+        total_money = (
+            wallet.cash
+            + wallet.bank
+        )
+
+        lines.append(
+            f"{medal} {name} — "
+            f"سطح {stats.level} — "
+            f"${total_money:,}"
+        )
+
+    return GameResponse(
+        text=(
+            "🏆 <b>رتبه‌بندی City</b>\n\n"
+            + "\n".join(lines)
+        ),
+        response_type=ResponseType.PERSONAL,
+    )
+
+
+# ================================================================
+# 20. SESSION INPUT
+# ================================================================
+
+async def handle_session_input(
+    context: GameContext,
+    session: dict[str, Any],
+) -> GameResponse:
+
+    state_value = session.get(
+        "state",
+        SessionState.IDLE.value,
+    )
+
+    try:
+        state = SessionState(
+            state_value
+        )
+    except ValueError:
+
+        await expire_session(
+            context.user_id,
+            context.city_id,
+        )
+
+        return error_response(
+            GameError.SESSION_EXPIRED
+        )
+
+    payload = session.get(
+        "payload",
+        {},
+    )
+
+    normalized = context.normalized_text
+
+    # ------------------------------------------------------------
+    # CHOICE
+    # ------------------------------------------------------------
+
+    if (
+        state
+        == SessionState.WAITING_FOR_CHOICE
+    ):
+
+        action = payload.get(
+            "action"
+        )
+
+        if action != "mission_select":
+
+            await expire_session(
+                context.user_id,
+                context.city_id,
+            )
+
+            return error_response(
+                GameError.INVALID_ACTION
+            )
+
+        numeric = normalize_digits(
+            normalized
+        )
+
+        if not numeric.isdigit():
+
+            return GameResponse(
+                text=(
+                    "شماره مأموریت را بفرست.\n"
+                    "مثلاً: 1"
+                ),
+                response_type=(
+                    ResponseType.PERSONAL
+                ),
+                state=state,
+                session_id=payload.get(
+                    "session_id"
+                ),
+            )
+
+        choice = int(
+            numeric
+        )
+
+        missions = payload.get(
+            "missions",
+            [],
+        )
+
+        if (
+            choice < 1
+            or choice > len(missions)
+        ):
+
+            return GameResponse(
+                text=(
+                    "این شماره در فهرست مأموریت‌ها نیست.\n"
+                    "یکی از شماره‌های نمایش‌داده‌شده را بفرست."
+                ),
+                response_type=(
+                    ResponseType.PERSONAL
+                ),
+                state=state,
+                session_id=payload.get(
+                    "session_id"
+                ),
+            )
+
+        selected = missions[
+            choice - 1
+        ]
+
+        await update_session(
+            context.user_id,
+            context.city_id,
+            SessionState.WAITING_FOR_CONFIRMATION,
+            {
+                "selected_mission":
+                    selected
+            },
+        )
+
+        return GameResponse(
+            text=(
+                "🎯 <b>مأموریت انتخابی</b>\n\n"
+                f"{selected['title']}\n\n"
+                f"📌 {selected.get('description', '')}\n"
+                f"💰 پاداش: {selected.get('reward_cash', 0):,}\n"
+                f"⭐ XP: {selected.get('reward_xp', 0):,}\n"
+                f"⚡ هزینه انرژی: {selected.get('energy_cost', 0)}\n\n"
+                "برای شروع بنویس «بله».\n"
+                "برای لغو بنویس «نه»."
+            ),
+            response_type=ResponseType.PERSONAL,
+            state=SessionState.WAITING_FOR_CONFIRMATION,
+            session_id=payload.get(
+                "session_id"
+            ),
+        )
+
+    # ------------------------------------------------------------
+    # CONFIRMATION
+    # ------------------------------------------------------------
+
+    if (
+        state
+        == SessionState.WAITING_FOR_CONFIRMATION
+    ):
+
+        intent = detect_intent(
+            normalized
+        )
+
+        selected = payload.get(
+            "selected_mission"
+        )
+
+        if intent == IntentType.CANCEL:
+
+            await expire_session(
+                context.user_id,
+                context.city_id,
+            )
+
+            return GameResponse(
+                text=(
+                    "مأموریت لغو شد.\n\n"
+                    "هر وقت خواستی دوباره «مأموریت» را بفرست."
+                ),
+                response_type=(
+                    ResponseType.PERSONAL
+                ),
+            )
+
+        if intent != IntentType.CONFIRM:
+
+            return GameResponse(
+                text=(
+                    "برای ادامه «بله» و برای لغو «نه» را بفرست."
+                ),
+                response_type=(
+                    ResponseType.PERSONAL
+                ),
+                state=state,
+                session_id=payload.get(
+                    "session_id"
+                ),
+            )
+
+        if not selected:
+
+            await expire_session(
+                context.user_id,
+                context.city_id,
+            )
+
+            return error_response(
+                GameError.INVALID_ACTION
+            )
+
+        mission_id = selected.get(
+            "id"
+        )
+
+        energy_cost = int(
+            selected.get(
+                "energy_cost",
+                0,
+            )
+        )
+
+        async with distributed_lock(
+            f"mission-start:"
+            f"{context.user_id}:"
+            f"{context.city_id}:"
+            f"{mission_id}",
+            ttl_seconds=8,
+            wait_seconds=1,
+        ) as acquired:
+
+            if not acquired:
+
+                return error_response(
+                    GameError.COOLDOWN
+                )
+
+            async with db_session() as session:
+
+                member_result = (
+                    await session.execute(
+                        select(
+                            CityMember
+                        )
+                        .where(
+                            CityMember.city_id
+                            == context.city_id,
+                            CityMember.user_id
+                            == context.user_id,
+                            CityMember.is_active.is_(True),
+                        )
+                        .with_for_update()
+                    )
+                )
+
+                member = (
+                    member_result
+                    .scalar_one_or_none()
+                )
+
+                if member is None:
+
+                    return error_response(
+                        GameError.NOT_MEMBER
+                    )
+
+                if (
+                    member.energy
+                    < energy_cost
+                ):
+
+                    return error_response(
+                        GameError.INSUFFICIENT_ENERGY
+                    )
+
+                member.energy -= (
+                    energy_cost
+                )
+
+                member.last_active_at = (
+                    datetime_now()
+                )
+
+                if (
+                    selected.get("id")
+                    and isinstance(
+                        selected.get("id"),
+                        int,
+                    )
+                ):
+
+                    progress = (
+                        MissionProgress(
+                            user_id=
+                                context.user_id,
+                            city_id=
+                                context.city_id,
+                            mission_id=
+                                mission_id,
+                            progress=0,
+                            status=
+                                "in_progress",
+                        )
+                    )
+
+                    session.add(
+                        progress
+                    )
+
+                await session.flush()
+
+                await expire_session(
+                    context.user_id,
+                    context.city_id,
+                )
+
+        return GameResponse(
+            text=(
+                "✅ <b>مأموریت شروع شد.</b>\n\n"
+                f"{selected.get('title', 'مأموریت')}\n\n"
+                f"⚡ {energy_cost} انرژی مصرف شد.\n\n"
+                "پیشرفت مأموریت از اینجا ادامه پیدا می‌کند."
+            ),
+            response_type=ResponseType.PERSONAL,
+            state=SessionState.MISSION_ACTIVE,
+        )
+
+    # ------------------------------------------------------------
+    # UNKNOWN SESSION
+    # ------------------------------------------------------------
+
+    await expire_session(
+        context.user_id,
+        context.city_id,
+    )
+
+    return error_response(
+        GameError.SESSION_EXPIRED
+    )
+
+
+# ================================================================
+# 21. UTILITY
+# ================================================================
+
+def datetime_now():
+    """
+    Lightweight local import to avoid exposing datetime as
+    part of the public Game API.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.now(
+        timezone.utc
+    )
+
+
+# ================================================================
+# 22. PUBLIC EVENT FACTORIES
 # ================================================================
 
 def create_city_vote(
     city_id: int,
     question: str,
-    metadata: dict[str, Any] | None = None,
+    metadata: Optional[
+        dict[str, Any]
+    ] = None,
 ) -> GameResponse:
-    """
-    Factory for city-wide vote events.
-    Returns a public GameResponse with action metadata.
-    handlers.py builds the actual buttons using Button Factory.
-    """
+
     return GameResponse(
-        text=f"🏛 یک تصمیم مهم برای City داریم.\n\n{question}",
-        response_type=ResponseType.PUBLIC_VOTE,
+        text=(
+            "🏛 <b>تصمیم City</b>\n\n"
+            f"{question}\n\n"
+            "نظر خودت را انتخاب کن."
+        ),
+        response_type=(
+            ResponseType.PUBLIC_VOTE
+        ),
         public=True,
         requires_ui=True,
         actions=[
-            ActionButton("VOTE_YES", "بله",  ActionStyle.SUCCESS),
-            ActionButton("VOTE_NO",  "خیر",  ActionStyle.DANGER),
+            ActionButton(
+                action="VOTE_YES",
+                label="موافقم",
+                style=ActionStyle.SUCCESS,
+            ),
+            ActionButton(
+                action="VOTE_NO",
+                label="مخالفم",
+                style=ActionStyle.DANGER,
+            ),
         ],
-        metadata={"city_id": city_id, **(metadata or {})},
+        metadata={
+            "city_id": city_id,
+            **(metadata or {}),
+        },
     )
 
 
 def create_global_event(
     title: str,
     description: str,
-    metadata: dict[str, Any] | None = None,
+    metadata: Optional[
+        dict[str, Any]
+    ] = None,
 ) -> GameResponse:
-    """
-    Factory for world-wide events.
-    handlers.py renders JOIN / VIEW buttons.
-    """
+
     return GameResponse(
-        text=f"🌍 {title}\n\n{description}",
-        response_type=ResponseType.PUBLIC_EVENT,
+        text=(
+            f"🌍 <b>{title}</b>\n\n"
+            f"{description}"
+        ),
+        response_type=(
+            ResponseType.PUBLIC_EVENT
+        ),
         public=True,
         requires_ui=True,
         actions=[
-            ActionButton("JOIN_EVENT", "شرکت در Event", ActionStyle.SUCCESS),
-            ActionButton("VIEW_EVENT", "مشاهده",        ActionStyle.PRIMARY),
+            ActionButton(
+                action="JOIN_EVENT",
+                label="شرکت در Event",
+                style=ActionStyle.SUCCESS,
+            ),
+            ActionButton(
+                action="VIEW_EVENT",
+                label="جزئیات",
+                style=ActionStyle.PRIMARY,
+            ),
         ],
-        metadata=metadata or {},
+        metadata=(
+            metadata or {}
+        ),
     )
 
 
-def create_legendary_discovery(username: str, discovery: str) -> GameResponse:
-    """
-    Legendary discovery: public broadcast, no buttons needed.
-    """
+def create_legendary_discovery(
+    username: str,
+    discovery: str,
+) -> GameResponse:
+
     return GameResponse(
         text=(
-            f"💎 یک Discovery افسانه‌ای پیدا شد!\n\n"
-            f"@{username} اولین کسی بود که «{discovery}» رو کشف کرد."
+            "💎 <b>Discovery افسانه‌ای</b>\n\n"
+            f"@{username} اولین کسی بود که "
+            f"«{discovery}» را کشف کرد."
         ),
-        response_type=ResponseType.PUBLIC,
+        response_type=(
+            ResponseType.PUBLIC
+        ),
         public=True,
         requires_ui=False,
     )
 
 
 # ================================================================
-# SECTION 10: ERROR HELPERS
-# ================================================================
-
-_ERROR_TEXT: dict[GameError, str] = {
-    GameError.INVALID_ACTION:      "این کار الان امکان‌پذیر نیست.",
-    GameError.SESSION_EXPIRED:     (
-        "این مرحله منقضی شده.\n"
-        "برای شروع دوباره، درخواستت رو دوباره بفرست."
-    ),
-    GameError.NOT_MEMBER:          "اول باید وارد این City بشی.",
-    GameError.INSUFFICIENT_ENERGY: (
-        "⚡ انرژی کافی نداری.\n"
-        "برای این کار انرژی بیشتری لازمه."
-    ),
-    GameError.INSUFFICIENT_FUNDS:  "💰 موجودی کافی نداری.",
-    GameError.COOLDOWN:            "⏳ هنوز باید کمی صبر کنی.",
-    GameError.RATE_LIMITED:        "خیلی سریع درخواست می‌دی. کمی صبر کن.",
-    GameError.UNKNOWN_INTENT:      "متوجه نشدم. «راهنما» بفرست.",
-    GameError.INVALID_INPUT:       "ورودی معتبر نیست.",
-    GameError.FEATURE_NOT_READY:   "این بخش هنوز فعال نشده.",
-}
-
-
-def _error_response(error: GameError, ctx: GameContext) -> GameResponse:
-    return GameResponse(
-        text=_ERROR_TEXT.get(error, "یه مشکل پیش اومد."),
-        response_type=ResponseType.PERSONAL,
-        public=False,
-        state=SessionState.IDLE,
-        error=error,
-    )
-
-
-# ================================================================
-# SECTION 11: MEMBERSHIP CHECK
-# ================================================================
-
-async def check_membership(user_id: int, city_id: int) -> bool:
-    """
-    Stub — will call database.py in integration.
-    Returns True when user is a member of city_id.
-    """
-    # TODO-integration: replace with db.is_member(user_id, city_id)
-    return True  # default open during bootstrap
-
-
-# ================================================================
-# SECTION 12: MAIN ENGINE — process_message
-# ================================================================
-
-async def process_message(ctx: GameContext) -> GameResponse:
-    """
-    Central pipeline:
-        GameContext
-          → Session check (priority)
-          → Intent detection
-          → Access check
-          → Membership check
-          → Action dispatch
-          → GameResponse
-    """
-    norm = ctx.normalized_text
-
-    # ── 1. Active session takes priority ────────────────────────
-    session = await get_session(ctx.user_id, ctx.city_id)
-    if session:
-        return await _handle_session_input(ctx, session)
-
-    # ── 2. Intent detection ──────────────────────────────────────
-    intent = detect_intent(norm)
-
-    # Numeric without session → ignore
-    if intent == IntentType.NUMERIC:
-        return GameResponse(response_type=ResponseType.SILENT)
-
-    # No game intent → ignore normal group chat
-    if intent == IntentType.NO_INTENT:
-        return GameResponse(response_type=ResponseType.SILENT)
-
-    # Bare CONFIRM / CANCEL without session → ignore
-    if intent in (IntentType.CONFIRM, IntentType.CANCEL):
-        return GameResponse(response_type=ResponseType.SILENT)
-
-    # ── 3. Access rules ─────────────────────────────────────────
-    access_error = _check_access(intent, ctx)
-    if access_error:
-        return _error_response(access_error, ctx)
-
-    # ── 4. Membership check for protected intents ────────────────
-    rule = _ACCESS.get(intent)
-    if rule and rule.requires_member:
-        is_member = await check_membership(ctx.user_id, ctx.city_id)
-        if not is_member:
-            return _error_response(GameError.NOT_MEMBER, ctx)
-
-    # ── 5. Dispatch to action handler ───────────────────────────
-    handler = _ACTION_REGISTRY.get(intent)
-    if handler is None:
-        return _error_response(GameError.UNKNOWN_INTENT, ctx)
-
-    return await handler(ctx, None)
-
-
-# ================================================================
-# SECTION 13: LIVING WORLD / NETWORK EFFECT CONTRACTS
+# 23. PUBLIC NETWORK CONTRACTS
 # ================================================================
 
 @dataclass
 class CityEventContract:
-    """
-    Placeholder contract for CityEvent Engine (future Prompt).
-    game.py creates this; the event dispatcher publishes it.
-    """
-    event_type:  str                # e.g. "CITY_LEVEL_UP", "CITY_CRISIS"
-    city_id:     int
-    payload:     dict[str, Any]     = field(default_factory=dict)
-    response:    GameResponse | None = None
+    event_type: str
+
+    city_id: int
+
+    payload: dict[str, Any] = field(
+        default_factory=dict
+    )
+
+    response: Optional[
+        GameResponse
+    ] = None
 
 
 @dataclass
 class NetworkSnapshot:
-    """
-    Data consumed from the Network Effect Engine (future Prompt).
-    Passed into actions that depend on city activity.
-    """
-    city_id:           int
-    active_citizens:   int  = 0
-    city_growth_score: int  = 0
-    activity_level:    str  = "low"   # low / medium / high / peak
-    referral_count:    int  = 0
-    milestone_count:   int  = 0
+    city_id: int
+
+    active_citizens: int = 0
+
+    city_growth_score: int = 0
+
+    activity_level: str = "low"
+
+    referral_count: int = 0
+
+    milestone_count: int = 0
 
 
 # ================================================================
-# SECTION 14: ANTI-ABUSE HELPERS
+# 24. RATE LIMIT
 # ================================================================
 
-_rate_limit_store: dict[str, list[float]] = {}
-RATE_LIMIT_WINDOW  = 5.0   # seconds
-RATE_LIMIT_MAX_MSG = 5     # messages per window
+_rate_history: dict[
+    tuple[int, int],
+    list[float],
+] = {}
+
+RATE_LIMIT_WINDOW = 5.0
+
+RATE_LIMIT_MAX_MESSAGES = 5
 
 
-async def check_rate_limit(user_id: int, city_id: int) -> bool:
-    """Returns True if the user is within rate limits."""
-    key = f"{user_id}:{city_id}"
+async def check_rate_limit(
+    user_id: int,
+    city_id: int,
+) -> bool:
+    """
+    Lightweight in-process guard.
+
+    Full distributed rate limit can use Redis later.
+    """
+
+    key = (
+        user_id,
+        city_id,
+    )
+
     now = time.time()
-    history = _rate_limit_store.get(key, [])
-    # Keep only events inside the window
-    history = [t for t in history if now - t < RATE_LIMIT_WINDOW]
-    if len(history) >= RATE_LIMIT_MAX_MSG:
-        _rate_limit_store[key] = history
+
+    history = _rate_history.get(
+        key,
+        [],
+    )
+
+    history = [
+        timestamp
+        for timestamp in history
+        if now - timestamp
+        < RATE_LIMIT_WINDOW
+    ]
+
+    if (
+        len(history)
+        >= RATE_LIMIT_MAX_MESSAGES
+    ):
+
+        _rate_history[key] = history
+
         return False
-    history.append(now)
-    _rate_limit_store[key] = history
+
+    history.append(
+        now
+    )
+
+    _rate_history[key] = history
+
     return True
 
 
 # ================================================================
-# SECTION 15: INTEGRATION NOTES
+# 25. CENTRAL MESSAGE PROCESSOR
 # ================================================================
-#
-# database.py integration points:
-#   • check_membership(user_id, city_id)   → db.is_member(...)
-#   • _handle_profile(...)                 → db.get_profile(user_id, city_id)
-#   • _handle_city(...)                    → db.get_city(city_id)
-#   • _handle_missions(...)                → db.get_missions(user_id, city_id)
-#   • Session store                        → Redis (replace _session_store)
-#
-# handlers.py integration:
-#   • Receives GameResponse
-#   • Checks response_type / public / requires_ui
-#   • Builds InlineKeyboardButton from response.actions via Button Factory
-#   • Calls bot.send_message() / message.answer() / message.edit_text()
-#   • Button styles: ActionStyle.PRIMARY / SUCCESS / DANGER
-#
-# config.py:
-#   • SESSION_TTL, RATE_LIMIT_* pulled from config
-#
-# ================================================================
+
+async def process_message(
+    context: GameContext,
+) -> GameResponse:
+    """
+    Main ECHO Game Pipeline.
+    """
+
+    # ------------------------------------------------------------
+    # 1. Empty input
+    # ------------------------------------------------------------
+
+    if not context.normalized_text:
+
+        return GameResponse(
+            response_type=ResponseType.SILENT
+        )
+
+    # ------------------------------------------------------------
+    # 2. Rate limit
+    # ------------------------------------------------------------
+
+    allowed = await check_rate_limit(
+        context.user_id,
+        context.city_id,
+    )
+
+    if not allowed:
+
+        return error_response(
+            GameError.RATE_LIMITED
+        )
+
+    # ------------------------------------------------------------
+    # 3. Active Session FIRST
+    # ------------------------------------------------------------
+
+    session = await get_active_session(
+        context.user_id,
+        context.city_id,
+    )
+
+    if session:
+
+        return await handle_session_input(
+            context,
+            session,
+        )
+
+    # ------------------------------------------------------------
+    # 4. Intent Detection
+    # ------------------------------------------------------------
+
+    intent = detect_intent(
+        context.normalized_text
+    )
+
+    # ------------------------------------------------------------
+    # 5. Normal Group Chat
+    # ------------------------------------------------------------
+
+    if (
+        intent
+        == IntentType.NO_INTENT
+    ):
+
+        return GameResponse(
+            response_type=ResponseType.SILENT
+        )
+
+    # ------------------------------------------------------------
+    # 6. Numeric without Session
+    # ------------------------------------------------------------
+
+    if (
+        intent
+        == IntentType.NUMERIC
+    ):
+
+        return GameResponse(
+            response_type=ResponseType.SILENT
+        )
+
+    # ------------------------------------------------------------
+    # 7. Bare Confirmation / Cancel
+    # ------------------------------------------------------------
+
+    if intent in (
+        IntentType.CONFIRM,
+        IntentType.CANCEL,
+    ):
+
+        return GameResponse(
+            response_type=ResponseType.SILENT
+        )
+
+    # ------------------------------------------------------------
+    # 8. Access
+    # ------------------------------------------------------------
+
+    access_error = check_access(
+        intent,
+        context,
+    )
+
+    if access_error:
+
+        return error_response(
+            access_error
+        )
+
+    # ------------------------------------------------------------
+    # 9. Membership
+    # ------------------------------------------------------------
+
+    rule = ACCESS_RULES.get(
+        intent
+    )
+
+    if (
+        rule
+        and rule.requires_member
+    ):
+
+        member = await is_city_member(
+            context.user_id,
+            context.city_id,
+        )
+
+        if not member:
+
+            return error_response(
+                GameError.NOT_MEMBER
+            )
+
+    # ------------------------------------------------------------
+    # 10. Handler
+    # ------------------------------------------------------------
+
+    action = _ACTIONS.get(
+        intent
+    )
+
+    if action is None:
+
+        return error_response(
+            GameError.UNKNOWN_INTENT
+        )
+
+    return await action(
+        context,
+        None,
+    )
 
 
 # ================================================================
-# SECTION 16: TESTS
+# 26. GAME ENGINE FACADE
+# ================================================================
+
+class GameEngine:
+    """
+    Public ECHO Engine API.
+
+    handlers.py and main.py should use this facade.
+    """
+
+    async def process_message(
+        self,
+        context: GameContext,
+    ) -> GameResponse:
+
+        return await process_message(
+            context
+        )
+
+    async def detect_intent(
+        self,
+        text: str,
+    ) -> IntentType:
+
+        return detect_intent(
+            normalize_text(text)
+        )
+
+    async def check_rate_limit(
+        self,
+        user_id: int,
+        city_id: int,
+    ) -> bool:
+
+        return await check_rate_limit(
+            user_id,
+            city_id,
+        )
+
+    async def get_session(
+        self,
+        user_id: int,
+        city_id: int,
+    ) -> Optional[
+        dict[str, Any]
+    ]:
+
+        return await get_active_session(
+            user_id,
+            city_id,
+        )
+
+    async def create_city_vote(
+        self,
+        city_id: int,
+        question: str,
+        metadata: Optional[
+            dict[str, Any]
+        ] = None,
+    ) -> GameResponse:
+
+        return create_city_vote(
+            city_id,
+            question,
+            metadata,
+        )
+
+    async def create_global_event(
+        self,
+        title: str,
+        description: str,
+        metadata: Optional[
+            dict[str, Any]
+        ] = None,
+    ) -> GameResponse:
+
+        return create_global_event(
+            title,
+            description,
+            metadata,
+        )
+
+    async def create_legendary_discovery(
+        self,
+        username: str,
+        discovery: str,
+    ) -> GameResponse:
+
+        return create_legendary_discovery(
+            username,
+            discovery,
+        )
+
+
+# ================================================================
+# 27. SINGLETON ENGINE
+# ================================================================
+
+_game_engine: Optional[
+    GameEngine
+] = None
+
+
+def get_game_engine() -> GameEngine:
+    """
+    Return shared ECHO Game Engine.
+    """
+
+    global _game_engine
+
+    if _game_engine is None:
+
+        _game_engine = GameEngine()
+
+    return _game_engine
+
+
+# ================================================================
+# 28. PUBLIC EXPORTS
+# ================================================================
+
+__all__ = [
+    "IntentType",
+    "SessionState",
+    "ResponseType",
+    "ActionStyle",
+    "GameError",
+    "GameContext",
+    "ActionButton",
+    "GameResponse",
+    "normalize_text",
+    "detect_intent",
+    "process_message",
+    "GameEngine",
+    "get_game_engine",
+    "create_city_vote",
+    "create_global_event",
+    "create_legendary_discovery",
+    "check_rate_limit",
+    "CityEventContract",
+    "NetworkSnapshot",
+]
+
+
+# ================================================================
+# 29. LOCAL FOUNDATION TESTS
 # ================================================================
 
 if __name__ == "__main__":
+
     import asyncio
 
-    async def _run_tests() -> None:
-        sep = "─" * 55
-        passed = failed = 0
+    async def run_tests() -> None:
 
-        async def check(label: str, got: Any, expected: Any) -> None:
+        passed = 0
+        failed = 0
+
+        def check(
+            name: str,
+            actual: Any,
+            expected: Any,
+        ) -> None:
+
             nonlocal passed, failed
-            ok = got == expected
-            symbol = "✓" if ok else "✗"
-            print(f"  {symbol}  {label}")
-            if not ok:
-                print(f"      expected: {expected!r}")
-                print(f"      got:      {got!r}")
-                failed += 1
-            else:
+
+            if actual == expected:
+
+                print(
+                    f"✓ {name}"
+                )
+
                 passed += 1
 
-        def ctx(text: str, uid: int = 1, cid: int = 10, **kw) -> GameContext:
-            return GameContext(user_id=uid, city_id=cid,
-                               chat_id=cid, message_id=1,
-                               text=text, is_group=True, **kw)
+            else:
 
-        # ── Normalization ──────────────────────────────────────
-        print(f"\n{sep}\n  TEXT NORMALIZATION\n{sep}")
-        await check("arabic ي→ی", normalize_text("ماموريت"), "ماموریت")
-        await check("arabic ك→ک", normalize_text("كار"),     "کار")
-        await check("trailing ؟", normalize_text("شهر؟"),    "شهر")
-        await check("ZWNJ→space",
-                    normalize_text("مأموریت\u200cها"), "مأموریت ها")
+                print(
+                    f"✗ {name}"
+                    f"\n  expected={expected!r}"
+                    f"\n  actual={actual!r}"
+                )
 
-        # ── Intent detection ──────────────────────────────────
-        print(f"\n{sep}\n  INTENT DETECTION\n{sep}")
-        await check("مأموریت",          detect_intent("مأموریت"),      IntentType.MISSIONS)
-        await check("شهرمون",           detect_intent("شهرمون"),       IntentType.CITY)
-        await check("پروفایل",          detect_intent("پروفایل"),      IntentType.PROFILE)
-        await check("بازار",            detect_intent("بازار"),        IntentType.MARKET)
-        await check("رتبه",             detect_intent("رتبه"),         IntentType.RANK)
-        await check("بله=CONFIRM",      detect_intent("بله"),          IntentType.CONFIRM)
-        await check("نه=CANCEL",        detect_intent("نه"),           IntentType.CANCEL)
-        await check("2=NUMERIC",        detect_intent("2"),            IntentType.NUMERIC)
-        await check("سلام=NO_INTENT",   detect_intent("سلام"),         IntentType.NO_INTENT)
-        await check("فوتبال=NO_INTENT", detect_intent("فوتبال"),       IntentType.NO_INTENT)
+                failed += 1
 
-        # ── Normal group chat → silent ─────────────────────────
-        print(f"\n{sep}\n  NORMAL GROUP CHAT (must be silent)\n{sep}")
-        r = await process_message(ctx("امروز کسی فوتبال میاد؟"))
-        await check("football chat silent", r.is_silent, True)
-        r = await process_message(ctx("😂"))
-        await check("emoji silent",         r.is_silent, True)
-        r = await process_message(ctx("سلام"))
-        await check("hello silent",         r.is_silent, True)
+        # --------------------------------------------------------
+        # Normalize
+        # --------------------------------------------------------
 
-        # ── Numeric without session → silent ───────────────────
-        print(f"\n{sep}\n  NUMERIC WITHOUT SESSION\n{sep}")
-        r = await process_message(ctx("2", uid=999, cid=50))
-        await check("bare 2 silent", r.is_silent, True)
-
-        # ── Help ──────────────────────────────────────────────
-        print(f"\n{sep}\n  HELP\n{sep}")
-        r = await process_message(ctx("راهنما"))
-        await check("help is personal", r.response_type, ResponseType.PERSONAL)
-        await check("help not public",  r.public,        False)
-
-        # ── Profile ───────────────────────────────────────────
-        print(f"\n{sep}\n  PROFILE\n{sep}")
-        r = await process_message(ctx("پروفایل", uid=10, cid=10))
-        await check("profile personal", r.response_type, ResponseType.PERSONAL)
-        await check("profile not public", r.public, False)
-        await check("profile has metadata", "profile" in r.metadata, True)
-
-        # ── Multi-City isolation ──────────────────────────────
-        print(f"\n{sep}\n  MULTI-CITY ISOLATION\n{sep}")
-        r_a = await process_message(ctx("مأموریت", uid=100, cid=10))
-        r_b = await process_message(ctx("پروفایل", uid=100, cid=20))
-        await check("city A session created",    r_a.state,  SessionState.WAITING_FOR_CHOICE)
-        await check("city B profile personal",   r_b.response_type, ResponseType.PERSONAL)
-        # City A session must not bleed into City B
-        sess_b = await get_session(100, 20)
-        await check("city B has no choice session", sess_b is None, True)
-        # Clean up
-        await expire_session(100, 10)
-
-        # ── Session priority ──────────────────────────────────
-        print(f"\n{sep}\n  SESSION PRIORITY\n{sep}")
-        uid, cid = 200, 10
-        # Start a mission flow
-        await process_message(ctx("مأموریت", uid=uid, cid=cid))
-        # Send numeric choice
-        r = await process_message(ctx("2", uid=uid, cid=cid))
-        await check("session intercepts numeric",
-                    r.state, SessionState.WAITING_FOR_CONFIRMATION)
-        # Confirm
-        r = await process_message(ctx("بله", uid=uid, cid=cid))
-        await check("confirm completes mission", r.state, SessionState.COMPLETED)
-        # Ensure session cleared
-        sess = await get_session(uid, cid)
-        await check("session cleared after complete", sess is None, True)
-
-        # ── Session cancellation ──────────────────────────────
-        print(f"\n{sep}\n  SESSION CANCELLATION\n{sep}")
-        uid2, cid2 = 300, 10
-        await process_message(ctx("مأموریت", uid=uid2, cid=cid2))
-        await process_message(ctx("1", uid=uid2, cid=cid2))   # select mission 1
-        r = await process_message(ctx("نه", uid=uid2, cid=cid2))
-        await check("cancel returns to idle", r.state, SessionState.IDLE)
-
-        # ── Public event factory ──────────────────────────────
-        print(f"\n{sep}\n  PUBLIC EVENT FACTORIES\n{sep}")
-        vote = create_city_vote(10, "مالیات افزایش پیدا کند؟")
-        await check("vote is public",       vote.public,       True)
-        await check("vote requires_ui",     vote.requires_ui,  True)
-        await check("vote actions count",   len(vote.actions), 2)
-        await check("vote action VOTE_YES", vote.actions[0].action, "VOTE_YES")
-        await check("vote YES style",
-                    vote.actions[0].style, ActionStyle.SUCCESS)
-
-        event = create_global_event("رویداد جهانی", "یک چالش بزرگ شروع شده.")
-        await check("global event public",      event.public,      True)
-        await check("global event requires_ui", event.requires_ui, True)
-        await check("JOIN_EVENT action",
-                    event.actions[0].action, "JOIN_EVENT")
-
-        legendary = create_legendary_discovery("Sajad", "گنجینه گمشده")
-        await check("legendary public",      legendary.public,      True)
-        await check("legendary no ui",       legendary.requires_ui, False)
-
-        # ── Feature not ready ─────────────────────────────────
-        print(f"\n{sep}\n  FEATURE-NOT-READY RESPONSES\n{sep}")
-        for word in ["کار", "اکتشاف", "بازار", "گیلد", "رتبه"]:
-            r = await process_message(ctx(word, uid=1, cid=10))
-            await check(f"{word} error=FEATURE_NOT_READY",
-                        r.error, GameError.FEATURE_NOT_READY)
-
-        # ── Rate limit ────────────────────────────────────────
-        print(f"\n{sep}\n  RATE LIMIT\n{sep}")
-        ok_count = sum(
-            [await check_rate_limit(777, 10) for _ in range(5)]
+        check(
+            "Persian normalization",
+            normalize_text("كار"),
+            "کار",
         )
-        blocked = not await check_rate_limit(777, 10)
-        await check("5 messages allowed", ok_count, 5)
-        await check("6th message blocked", blocked, True)
 
-        # ── Summary ───────────────────────────────────────────
-        total = passed + failed
-        print(f"\n{sep}")
-        print(f"  نتیجه: {passed}/{total} تست موفق"
-              + (" ✓" if failed == 0 else f"  |  {failed} تست ناموفق ✗"))
-        print(sep)
+        check(
+            "Question punctuation",
+            normalize_text("شهر؟"),
+            "شهر",
+        )
 
-    asyncio.run(_run_tests())
+        check(
+            "ZWNJ",
+            normalize_text(
+                "مأموریت\u200cها"
+            ),
+            "مأموریت ها",
+        )
+
+        # --------------------------------------------------------
+        # Intent
+        # --------------------------------------------------------
+
+        check(
+            "Mission intent",
+            detect_intent("مأموریت"),
+            IntentType.MISSIONS,
+        )
+
+        check(
+            "Profile intent",
+            detect_intent("پروفایل"),
+            IntentType.PROFILE,
+        )
+
+        check(
+            "City intent",
+            detect_intent("شهر"),
+            IntentType.CITY,
+        )
+
+        check(
+            "Help intent",
+            detect_intent("راهنما"),
+            IntentType.HELP,
+        )
+
+        check(
+            "Numeric",
+            detect_intent("2"),
+            IntentType.NUMERIC,
+        )
+
+        check(
+            "Normal chat",
+            detect_intent(
+                "سلام خوبی؟"
+            ),
+            IntentType.NO_INTENT,
+        )
+
+        # --------------------------------------------------------
+        # Engine
+        # --------------------------------------------------------
+
+        engine = get_game_engine()
+
+        check(
+            "Engine getter",
+            isinstance(
+                engine,
+                GameEngine,
+            ),
+            True,
+        )
+
+        # --------------------------------------------------------
+        # Public Vote
+        # --------------------------------------------------------
+
+        vote = create_city_vote(
+            10,
+            "مالیات افزایش پیدا کند؟",
+        )
+
+        check(
+            "Vote public",
+            vote.public,
+            True,
+        )
+
+        check(
+            "Vote requires UI",
+            vote.requires_ui,
+            True,
+        )
+
+        check(
+            "Vote button count",
+            len(vote.actions),
+            2,
+        )
+
+        check(
+            "Vote yes style",
+            vote.actions[0].style,
+            ActionStyle.SUCCESS,
+        )
+
+        check(
+            "Vote no style",
+            vote.actions[1].style,
+            ActionStyle.DANGER,
+        )
+
+        # --------------------------------------------------------
+        # Normal Chat
+        # --------------------------------------------------------
+
+        normal_context = GameContext(
+            user_id=100,
+            city_id=10,
+            chat_id=-10010,
+            message_id=1,
+            text="امروز کسی فوتبال میاد؟",
+        )
+
+        response = await process_message(
+            normal_context
+        )
+
+        check(
+            "Normal group chat silent",
+            response.is_silent,
+            True,
+        )
+
+        # --------------------------------------------------------
+        # Numeric without session
+        # --------------------------------------------------------
+
+        numeric_context = GameContext(
+            user_id=101,
+            city_id=10,
+            chat_id=-10010,
+            message_id=2,
+            text="2",
+        )
+
+        response = await process_message(
+            numeric_context
+        )
+
+        check(
+            "Numeric without session silent",
+            response.is_silent,
+            True,
+        )
+
+        # --------------------------------------------------------
+        # Help
+        # --------------------------------------------------------
+
+        help_context = GameContext(
+            user_id=102,
+            city_id=10,
+            chat_id=-10010,
+            message_id=3,
+            text="راهنما",
+        )
+
+        response = await process_message(
+            help_context
+        )
+
+        check(
+            "Help response",
+            response.response_type,
+            ResponseType.PERSONAL,
+        )
+
+        # --------------------------------------------------------
+        # Summary
+        # --------------------------------------------------------
+
+        print()
+        print(
+            f"Tests: {passed} passed / "
+            f"{failed} failed"
+        )
+
+    asyncio.run(
+        run_tests()
+    )
