@@ -375,8 +375,45 @@ class AuditLog(Base):
 # DATABASE — SESSION
 # ─────────────────────────────────────────────────────────────────
 
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    async_sessionmaker,
+    AsyncSession,
+)
+
+
+def normalize_database_url(url: str) -> str:
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    url = url.strip()
+
+    if url.startswith("postgres://"):
+        url = "postgresql+asyncpg://" + url[len("postgres://"):]
+
+    elif url.startswith("postgresql://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+
+    elif url.startswith("postgresql+psycopg2://"):
+        url = "postgresql+asyncpg://" + url[len("postgresql+psycopg2://"):]
+
+    elif not url.startswith("postgresql+asyncpg://"):
+        raise RuntimeError(
+            f"Unsupported DATABASE_URL scheme: {url.split('://')[0]}"
+        )
+
+    return url
+
+
+DATABASE_URL = normalize_database_url(cfg.DATABASE_URL)
+
+log.info(
+    "Database driver: %s",
+    DATABASE_URL.split("://", 1)[0]
+)
+
 engine = create_async_engine(
-    cfg.DATABASE_URL,
+    DATABASE_URL,
     echo=False,
     pool_size=3,
     max_overflow=2,
@@ -404,10 +441,11 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
     log.info("Database tables created/verified.")
+
     await seed_market()
     await seed_missions()
-
 
 # ─────────────────────────────────────────────────────────────────
 # REDIS
