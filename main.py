@@ -70,6 +70,7 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy.orm import DeclarativeBase
 class Base(DeclarativeBase):
     pass
 
