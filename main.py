@@ -70,6 +70,8 @@ from sqlalchemy import (
     select,
     update,
 )
+class Base(DeclarativeBase):
+    pass
 
 log = logging.getLogger("echo.city")
 
