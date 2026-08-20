@@ -28,7 +28,6 @@ from database import (
 from handlers import (
     group_router,
     private_router,
-    setup_bot_commands,
 )
 
 
@@ -274,26 +273,7 @@ async def startup(
         "Routers: group + private registered."
     )
 
-    # ------------------------------------------------------------
-    # 6. Bot commands
-    # ------------------------------------------------------------
-
-    try:
-
-        await setup_bot_commands(
-            bot
-        )
-
-        logger.info(
-            "Bot commands: configured."
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Bot command configuration failed."
-        )
-
+   
     # ------------------------------------------------------------
     # 7. Clear old webhook
     # ------------------------------------------------------------
