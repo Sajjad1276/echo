@@ -1,4 +1,4 @@
-
+from __future__ import annotations
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
@@ -33,8 +33,6 @@
 Broadcast، Help Analytics پایگاه‌داده‌ای کامل (نسخه ساده‌شده اضافه شده)،
 Item/Shop/Store، Payment/Stars. این‌ها در فاز بعدی روی همین پایه اضافه می‌شوند.
 """
-
-from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
