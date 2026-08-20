@@ -378,8 +378,8 @@ class AuditLog(Base):
 engine = create_async_engine(
     cfg.DATABASE_URL,
     echo=False,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=3,
+    max_overflow=2,
     pool_pre_ping=True,
 )
 
