@@ -785,14 +785,11 @@ async def cb_close(call: CallbackQuery) -> None:
 # ═════════════════════════════════════════════════════════════════
 
 async def init_city_tables() -> None:
-    """Migration ساده برای MVP — جدول‌های جدید را می‌سازد بدون دست‌زدن به قبلی‌ها.
-    برای Production واقعی از Alembic استفاده کن (بخش 140)."""
-    from main import engine
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
     log.info("City tables ready.")
-
-
+    
 async def setup_echo_city(dp: Dispatcher, bot: Bot) -> None:
     await init_city_tables()
 
