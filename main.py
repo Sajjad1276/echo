@@ -57,11 +57,17 @@ from sqlalchemy import (
     String, UniqueConstraint, select, update, func,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from sqlalchemy.orm import DeclarativeBase
 # ── از main.py موجود استفاده می‌کنیم (چیزی Duplicate نمی‌سازیم) ─────
 
 
 log = logging.getLogger("echo.city")
+
+
+
+
+class Base(DeclarativeBase):
+    pass
 
 # ─────────────────────────────────────────────────────────────────
 # DATABASE MODELS — بخش 134
