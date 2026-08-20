@@ -1,2 +1,2 @@
-worker: python echo_city.py
+worker: python main.py
 
