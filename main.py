@@ -59,10 +59,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # ── از main.py موجود استفاده می‌کنیم (چیزی Duplicate نمی‌سازیم) ─────
-from main import (
-    Base, get_session, get_or_none, cfg, log as base_log,
-    User, UserStats, Wallet, create_user, touch_user,
-)
+
 
 log = logging.getLogger("echo.city")
 
