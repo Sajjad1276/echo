@@ -22,15 +22,15 @@
 #
 # Architecture:
 #
-# config.py
-#     ↓
-# database.py
-#     ↓
-# game.py
-#     ↓
-# handlers.py
-#     ↓
-# main.py
+#   config.py
+#       ↓
+#   database.py
+#       ↓
+#   game.py
+#       ↓
+#   handlers.py
+#       ↓
+#   main.py
 # ================================================================
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ import json
 import logging
 import time
 import uuid
+
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
 
@@ -57,16 +58,20 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     select,
     text,
 )
+
 from sqlalchemy.dialects.postgresql import JSONB
+
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -89,26 +94,12 @@ logger = logging.getLogger("echo.database")
 # ================================================================
 
 def utcnow() -> datetime:
-    """
-    Return current timezone-aware UTC datetime.
-    """
     return datetime.now(timezone.utc)
 
 
-def normalize_postgres_url(raw_url: str) -> str:
-    """
-    Normalize PostgreSQL URL for asyncpg.
-
-    Supported:
-
-    postgresql://...
-    postgres://...
-    postgresql+asyncpg://...
-
-    Result:
-
-    postgresql+asyncpg://...
-    """
+def normalize_postgres_url(
+    raw_url: str,
+) -> str:
 
     if not raw_url:
         raise RuntimeError(
@@ -156,11 +147,11 @@ def normalize_postgres_url(raw_url: str) -> str:
 # DATABASE URL
 # ================================================================
 
-DATABASE_URL: str = normalize_postgres_url(
+DATABASE_URL = normalize_postgres_url(
     settings.database_url
 )
 
-REDIS_URL: str = settings.redis_url
+REDIS_URL = settings.redis_url
 
 
 # ================================================================
@@ -168,9 +159,6 @@ REDIS_URL: str = settings.redis_url
 # ================================================================
 
 class Base(DeclarativeBase):
-    """
-    Base class for all ECHO SQLAlchemy models.
-    """
     pass
 
 
@@ -187,7 +175,6 @@ engine: AsyncEngine = create_async_engine(
     pool_recycle=1800,
 )
 
-
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
@@ -202,26 +189,23 @@ AsyncSessionLocal = async_sessionmaker(
 
 @contextlib.asynccontextmanager
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """
-    Standard ECHO database session.
-
-    Example:
-
-        async with get_session() as session:
-            ...
-    """
 
     session = AsyncSessionLocal()
 
     try:
+
         yield session
+
         await session.commit()
 
     except Exception:
+
         await session.rollback()
+
         raise
 
     finally:
+
         await session.close()
 
 
@@ -229,20 +213,17 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 async def transaction(
     session: AsyncSession,
 ) -> AsyncIterator[AsyncSession]:
-    """
-    Transaction helper.
-
-    Uses nested transaction if a transaction already exists.
-    """
 
     if session.in_transaction():
 
         async with session.begin_nested():
+
             yield session
 
     else:
 
         async with session.begin():
+
             yield session
 
 
@@ -251,13 +232,6 @@ async def transaction(
 # ================================================================
 
 async def init_database() -> None:
-    """
-    Initialize database.
-
-    NOTE:
-    create_all is suitable for initial MVP/bootstrap.
-    Production schema changes should use Alembic.
-    """
 
     async with engine.begin() as conn:
 
@@ -285,8 +259,6 @@ async def init_database() -> None:
 async def init_models() -> None:
     """
     Backward-compatible alias.
-
-    Kept so older code does not break.
     """
 
     await init_database()
@@ -297,9 +269,6 @@ async def init_models() -> None:
 # ================================================================
 
 async def database_health() -> bool:
-    """
-    Check PostgreSQL connection.
-    """
 
     try:
 
@@ -335,9 +304,6 @@ redis_client: aioredis.Redis = (
 
 
 async def redis_health() -> bool:
-    """
-    Check Redis connection.
-    """
 
     try:
 
@@ -360,9 +326,6 @@ async def redis_health() -> bool:
 # ================================================================
 
 class RedisKeys:
-    """
-    Central Redis key naming.
-    """
 
     @staticmethod
     def session(
@@ -422,11 +385,14 @@ class RedisKeys:
         key: str,
     ) -> str:
 
-        return f"echo:cache:{namespace}:{key}"
+        return (
+            f"echo:cache:"
+            f"{namespace}:{key}"
+        )
 
 
 # ================================================================
-# REDIS SESSION
+# REDIS GAME SESSION
 # ================================================================
 
 async def set_game_session(
@@ -436,9 +402,6 @@ async def set_game_session(
     payload: Optional[dict[str, Any]] = None,
     ttl_seconds: int = 900,
 ) -> None:
-    """
-    Save live Game Session to Redis.
-    """
 
     key = RedisKeys.session(
         user_id,
@@ -465,16 +428,15 @@ async def get_game_session(
     user_id: int,
     city_id: int,
 ) -> Optional[dict[str, Any]]:
-    """
-    Get live Game Session.
-    """
 
     key = RedisKeys.session(
         user_id,
         city_id,
     )
 
-    raw = await redis_client.get(key)
+    raw = await redis_client.get(
+        key
+    )
 
     if raw is None:
         return None
@@ -486,16 +448,15 @@ async def clear_game_session(
     user_id: int,
     city_id: int,
 ) -> None:
-    """
-    Delete live Game Session.
-    """
 
     key = RedisKeys.session(
         user_id,
         city_id,
     )
 
-    await redis_client.delete(key)
+    await redis_client.delete(
+        key
+    )
 
 
 # ================================================================
@@ -512,9 +473,6 @@ async def set_intent_context(
     ] = None,
     ttl_seconds: int = 600,
 ) -> None:
-    """
-    Save temporary intent context.
-    """
 
     key = RedisKeys.intent(
         user_id,
@@ -550,7 +508,9 @@ async def get_intent_context(
         city_id,
     )
 
-    raw = await redis_client.get(key)
+    raw = await redis_client.get(
+        key
+    )
 
     if raw is None:
         return None
@@ -568,7 +528,9 @@ async def clear_intent_context(
         city_id,
     )
 
-    await redis_client.delete(key)
+    await redis_client.delete(
+        key
+    )
 
 
 # ================================================================
@@ -624,7 +586,9 @@ async def cooldown_ttl(
         action,
     )
 
-    ttl = await redis_client.ttl(key)
+    ttl = await redis_client.ttl(
+        key
+    )
 
     return max(ttl, 0)
 
@@ -637,13 +601,12 @@ async def acquire_lock(
     key: str,
     ttl_seconds: int = 10,
 ) -> Optional[str]:
-    """
-    Acquire Redis distributed lock.
-    """
 
     token = uuid.uuid4().hex
 
-    full_key = RedisKeys.lock(key)
+    full_key = RedisKeys.lock(
+        key
+    )
 
     acquired = await redis_client.set(
         full_key,
@@ -671,11 +634,10 @@ async def release_lock(
     key: str,
     token: str,
 ) -> bool:
-    """
-    Release Redis lock safely.
-    """
 
-    full_key = RedisKeys.lock(key)
+    full_key = RedisKeys.lock(
+        key
+    )
 
     result = await redis_client.eval(
         _RELEASE_LOCK_SCRIPT,
@@ -694,9 +656,6 @@ async def distributed_lock(
     wait_seconds: float = 5.0,
     retry_interval: float = 0.1,
 ) -> AsyncIterator[bool]:
-    """
-    Distributed Redis lock.
-    """
 
     deadline = (
         time.monotonic()
@@ -713,11 +672,9 @@ async def distributed_lock(
         )
 
         if token:
-
             break
 
         if time.monotonic() >= deadline:
-
             break
 
         await asyncio.sleep(
@@ -821,7 +778,9 @@ class User(Base):
         nullable=False,
     )
 
-    created_at: Mapped[datetime] = mapped_column(
+    created_at: Mapped[
+        datetime
+    ] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
         nullable=False,
@@ -889,7 +848,6 @@ class UserStats(Base):
         nullable=False,
     )
 
-    # Global Progression
     level: Mapped[int] = mapped_column(
         Integer,
         default=1,
@@ -934,7 +892,7 @@ class UserStats(Base):
     user: Mapped[
         "User"
     ] = relationship(
-        back_populates="stats",
+        back_populates="stats"
     )
 
 
@@ -952,9 +910,7 @@ class City(Base):
         autoincrement=True,
     )
 
-    telegram_chat_id: Mapped[
-        int
-    ] = mapped_column(
+    telegram_chat_id: Mapped[int] = mapped_column(
         BigInteger,
         unique=True,
         nullable=False,
@@ -1093,7 +1049,6 @@ class CityMember(Base):
         nullable=False,
     )
 
-    # City-specific
     energy: Mapped[int] = mapped_column(
         Integer,
         default=100,
@@ -1141,13 +1096,13 @@ class CityMember(Base):
     city: Mapped[
         "City"
     ] = relationship(
-        back_populates="members",
+        back_populates="members"
     )
 
     user: Mapped[
         "User"
     ] = relationship(
-        back_populates="memberships",
+        back_populates="memberships"
     )
 
     __table_args__ = (
@@ -1231,13 +1186,13 @@ class UserWallet(Base):
     user: Mapped[
         "User"
     ] = relationship(
-        back_populates="wallets",
+        back_populates="wallets"
     )
 
     city: Mapped[
         "City"
     ] = relationship(
-        back_populates="wallets",
+        back_populates="wallets"
     )
 
     __table_args__ = (
@@ -1834,7 +1789,7 @@ class GuildMember(Base):
     guild: Mapped[
         "Guild"
     ] = relationship(
-        back_populates="members",
+        back_populates="members"
     )
 
     __table_args__ = (
@@ -2228,18 +2183,6 @@ class CityGrowth(Base):
 # ================================================================
 # OFFICIAL UI STYLE CONTRACT
 # ================================================================
-#
-# فقط Reference معماری.
-#
-# UI واقعی در handlers.py ساخته می‌شود.
-#
-# Styles:
-#
-# PRIMARY
-# SUCCESS
-# DANGER
-#
-# ================================================================
 
 class OfficialButtonStyle(str, enum.Enum):
 
@@ -2262,6 +2205,20 @@ async def get_user(
     result = await session.execute(
         select(User).where(
             User.id == user_id
+        )
+    )
+
+    return result.scalar_one_or_none()
+
+
+async def get_user_stats(
+    session: AsyncSession,
+    user_id: int,
+) -> Optional[UserStats]:
+
+    result = await session.execute(
+        select(UserStats).where(
+            UserStats.user_id == user_id
         )
     )
 
@@ -2325,9 +2282,6 @@ async def get_or_create_user(
     username: Optional[str] = None,
     nickname: Optional[str] = None,
 ) -> User:
-    """
-    Global User creation/update.
-    """
 
     user = await get_user(
         session,
@@ -2363,10 +2317,14 @@ async def get_or_create_user(
         return user
 
     if username is not None:
+
         user.username = username
 
     if nickname:
+
         user.nickname = nickname[:64]
+
+    user.is_active = True
 
     user.last_active_at = utcnow()
 
@@ -2380,13 +2338,12 @@ async def get_or_create_user(
 # ================================================================
 
 def generate_city_code() -> str:
-    """
-    Generate a readable ECHO City code.
-    """
 
     return (
-        f"EC-"
-        f"{uuid.uuid4().hex[:8].upper()}"
+        "EC-"
+        + uuid.uuid4()
+        .hex[:8]
+        .upper()
     )
 
 
@@ -2398,13 +2355,21 @@ async def get_or_restore_city(
     owner_user_id: Optional[int] = None,
 ) -> City:
     """
-    Get existing City or create/restore it.
+    Create or restore City.
+
+    IMPORTANT:
+    Owner User is always created first.
+    This prevents ForeignKeyViolationError.
     """
 
     city = await get_city_by_chat(
         session,
         telegram_chat_id,
     )
+
+    # ------------------------------------------------------------
+    # EXISTING CITY
+    # ------------------------------------------------------------
 
     if city is not None:
 
@@ -2415,17 +2380,65 @@ async def get_or_restore_city(
 
         city.username = username
 
+        # فقط اگر Owner قبلی وجود نداشته باشد.
         if (
             owner_user_id is not None
             and city.owner_user_id is None
         ):
-            city.owner_user_id = owner_user_id
+
+            await get_or_create_user(
+                session=session,
+                user_id=owner_user_id,
+            )
+
+            city.owner_user_id = (
+                owner_user_id
+            )
 
         city.updated_at = utcnow()
 
         await session.flush()
 
+        # CityGrowth نیز اگر به هر دلیل وجود نداشت ساخته شود.
+        growth_result = await session.execute(
+            select(CityGrowth).where(
+                CityGrowth.city_id == city.id
+            )
+        )
+
+        growth = (
+            growth_result
+            .scalar_one_or_none()
+        )
+
+        if growth is None:
+
+            growth = CityGrowth(
+                city_id=city.id,
+                active_citizens=0,
+                daily_active=0,
+                weekly_active=0,
+                total_citizens=0,
+                event_participation=0,
+                growth_score=0,
+            )
+
+            session.add(growth)
+
+            await session.flush()
+
         return city
+
+    # ------------------------------------------------------------
+    # NEW CITY
+    # ------------------------------------------------------------
+
+    if owner_user_id is not None:
+
+        await get_or_create_user(
+            session=session,
+            user_id=owner_user_id,
+        )
 
     city = City(
         telegram_chat_id=telegram_chat_id,
@@ -2463,9 +2476,6 @@ async def deactivate_city(
     session: AsyncSession,
     telegram_chat_id: int,
 ) -> None:
-    """
-    Soft-disable City.
-    """
 
     city = await get_city_by_chat(
         session,
@@ -2476,6 +2486,7 @@ async def deactivate_city(
         return
 
     city.is_active = False
+
     city.updated_at = utcnow()
 
     await session.flush()
@@ -2492,8 +2503,25 @@ async def get_or_create_city_member(
     role: str = CityMemberRole.MEMBER.value,
 ) -> CityMember:
     """
-    Idempotent City membership.
+    Idempotent membership.
+
+    Also guarantees:
+      User exists
+      Wallet exists
     """
+
+    # ------------------------------------------------------------
+    # Ensure User
+    # ------------------------------------------------------------
+
+    await get_or_create_user(
+        session=session,
+        user_id=user_id,
+    )
+
+    # ------------------------------------------------------------
+    # Existing Membership
+    # ------------------------------------------------------------
 
     member = await get_city_member(
         session,
@@ -2504,11 +2532,35 @@ async def get_or_create_city_member(
     if member is not None:
 
         member.is_active = True
+
         member.last_active_at = utcnow()
 
         await session.flush()
 
+        wallet = await get_wallet(
+            session,
+            user_id,
+            city_id,
+        )
+
+        if wallet is None:
+
+            wallet = UserWallet(
+                user_id=user_id,
+                city_id=city_id,
+                cash=0,
+                bank=0,
+            )
+
+            session.add(wallet)
+
+            await session.flush()
+
         return member
+
+    # ------------------------------------------------------------
+    # New Membership
+    # ------------------------------------------------------------
 
     member = CityMember(
         city_id=city_id,
@@ -2524,7 +2576,6 @@ async def get_or_create_city_member(
 
     await session.flush()
 
-    # Create City wallet automatically.
     wallet = UserWallet(
         user_id=user_id,
         city_id=city_id,
@@ -2536,6 +2587,28 @@ async def get_or_create_city_member(
 
     await session.flush()
 
+    # Update City Growth
+    growth_result = await session.execute(
+        select(CityGrowth).where(
+            CityGrowth.city_id == city_id
+        )
+    )
+
+    growth = (
+        growth_result
+        .scalar_one_or_none()
+    )
+
+    if growth is not None:
+
+        growth.total_citizens += 1
+
+        growth.active_citizens += 1
+
+        growth.updated_at = utcnow()
+
+        await session.flush()
+
     return member
 
 
@@ -2544,9 +2617,6 @@ async def get_or_create_city_member(
 # ================================================================
 
 class InsufficientFundsError(Exception):
-    """
-    Raised when wallet balance is insufficient.
-    """
     pass
 
 
@@ -2560,7 +2630,6 @@ async def apply_wallet_delta(
 ) -> UserWallet:
     """
     Atomic Wallet Update.
-
     Uses SELECT FOR UPDATE.
     """
 
@@ -2575,7 +2644,10 @@ async def apply_wallet_delta(
         .with_for_update()
     )
 
-    wallet = result.scalar_one_or_none()
+    wallet = (
+        result
+        .scalar_one_or_none()
+    )
 
     if wallet is None:
 
@@ -2590,8 +2662,15 @@ async def apply_wallet_delta(
 
         await session.flush()
 
-    new_cash = wallet.cash + cash_delta
-    new_bank = wallet.bank + bank_delta
+    new_cash = (
+        wallet.cash
+        + cash_delta
+    )
+
+    new_bank = (
+        wallet.bank
+        + bank_delta
+    )
 
     if (
         not allow_negative_result
@@ -2600,12 +2679,15 @@ async def apply_wallet_delta(
             or new_bank < 0
         )
     ):
+
         raise InsufficientFundsError(
             "Insufficient ECHO funds."
         )
 
     wallet.cash = new_cash
+
     wallet.bank = new_bank
+
     wallet.updated_at = utcnow()
 
     await session.flush()
@@ -2622,11 +2704,11 @@ async def city_population(
     city_id: int,
 ) -> int:
 
-    from sqlalchemy import func
-
     result = await session.execute(
         select(
-            func.count(CityMember.id)
+            func.count(
+                CityMember.id
+            )
         ).where(
             CityMember.city_id
             == city_id,
@@ -2640,37 +2722,79 @@ async def city_population(
 
 
 # ================================================================
+# CITY RANKING
+# ================================================================
+
+async def city_ranking(
+    session: AsyncSession,
+    city_id: int,
+    limit: int = 10,
+) -> list[tuple]:
+
+    result = await session.execute(
+        select(
+            User,
+            UserStats,
+            UserWallet,
+            CityMember,
+        )
+        .join(
+            CityMember,
+            CityMember.user_id
+            == User.id,
+        )
+        .join(
+            UserStats,
+            UserStats.user_id
+            == User.id,
+        )
+        .join(
+            UserWallet,
+            (
+                UserWallet.user_id
+                == User.id
+            )
+            & (
+                UserWallet.city_id
+                == city_id
+            ),
+        )
+        .where(
+            CityMember.city_id
+            == city_id,
+            CityMember.is_active.is_(True),
+        )
+        .order_by(
+            UserStats.level.desc(),
+            UserStats.xp.desc(),
+            CityMember.city_reputation.desc(),
+        )
+        .limit(limit)
+    )
+
+    return result.all()
+
+
+# ================================================================
 # LIFECYCLE
 # ================================================================
 
 async def close_database() -> None:
-    """
-    Close PostgreSQL engine.
-    """
 
     await engine.dispose()
 
 
 async def close_engine() -> None:
-    """
-    Backward-compatible alias.
-    """
 
     await close_database()
 
 
 async def close_redis() -> None:
-    """
-    Close Redis connection.
-    """
 
     await redis_client.aclose()
 
 
 async def shutdown() -> None:
-    """
-    Close complete Data Layer.
-    """
 
     await close_redis()
 
@@ -2682,14 +2806,19 @@ async def shutdown() -> None:
 # ================================================================
 
 __all__ = [
+
     # Core
     "Base",
     "engine",
     "AsyncSessionLocal",
     "get_session",
     "transaction",
+
+    # Initialization
     "init_database",
     "init_models",
+
+    # Lifecycle
     "close_database",
     "close_engine",
     "close_redis",
@@ -2742,16 +2871,24 @@ __all__ = [
     "ReferralStatus",
     "OfficialButtonStyle",
 
-    # Helpers
+    # User
     "get_user",
-    "get_city_by_chat",
-    "get_city_member",
-    "get_wallet",
+    "get_user_stats",
     "get_or_create_user",
+
+    # City
+    "get_city_by_chat",
     "get_or_restore_city",
     "deactivate_city",
-    "get_or_create_city_member",
-    "apply_wallet_delta",
     "city_population",
+    "city_ranking",
+
+    # Membership
+    "get_city_member",
+    "get_or_create_city_member",
+
+    # Wallet
+    "get_wallet",
+    "apply_wallet_delta",
     "InsufficientFundsError",
 ]
