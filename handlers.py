@@ -13,6 +13,7 @@ from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     ChatMemberUpdated,
     CopyTextButton,
@@ -33,17 +34,20 @@ from database import (
     get_or_create_city_member,
     deactivate_city,
     get_session,
+    get_city_member,
 )
 
 from game import (
     ActionButton,
-    ActionStyle,
     GameContext,
     GameResponse,
-    ResponseType,
     process_message,
 )
 
+
+# ================================================================
+# LOGGER
+# ================================================================
 
 logger = logging.getLogger("echo.handlers")
 
@@ -89,7 +93,7 @@ group_router.callback_query.filter(
 
 
 # ================================================================
-# UI ICON REGISTRY
+# CUSTOM EMOJI
 # ================================================================
 
 UI_ICONS: dict[str, str] = {
@@ -157,46 +161,13 @@ UI_ICONS: dict[str, str] = {
 
 
 # ================================================================
-# FALLBACK ICONS
-# ================================================================
-
-FALLBACK_ICONS = {
-    "help": "📚",
-    "back": "◀️",
-    "close": "✖️",
-    "city": "🌆",
-    "mission": "🎯",
-    "explore": "🧭",
-    "market": "📈",
-    "guild": "👥",
-    "rank": "🏆",
-    "event": "🌪",
-    "vote": "🏛",
-    "add": "➕",
-}
-
-
-def icon(
-    key: str,
-) -> str:
-    return FALLBACK_ICONS.get(
-        key,
-        "",
-    )
-
-
-# ================================================================
-# BUTTON STYLE SYSTEM
+# BUTTON STYLES
 # ================================================================
 
 PRIMARY = "primary"
 SUCCESS = "success"
 DANGER = "danger"
 
-
-# ================================================================
-# BUTTON FACTORY
-# ================================================================
 
 def make_button(
     text: str,
@@ -205,11 +176,11 @@ def make_button(
     icon_key: Optional[str] = None,
 ) -> InlineKeyboardButton:
     """
-    Button واقعی Telegram.
+    Button Factory مرکزی ECHO.
 
     PRIMARY = آبی
     SUCCESS = سبز
-    DANGER = قرمز
+    DANGER  = قرمز
     """
 
     style = style.lower()
@@ -227,19 +198,16 @@ def make_button(
         "style": style,
     }
 
-    custom_emoji_id = (
-        UI_ICONS.get(
+    if icon_key:
+        custom_emoji_id = UI_ICONS.get(
             icon_key,
             "",
         )
-        if icon_key
-        else ""
-    )
 
-    if custom_emoji_id:
-        data["icon_custom_emoji_id"] = (
-            custom_emoji_id
-        )
+        if custom_emoji_id:
+            data[
+                "icon_custom_emoji_id"
+            ] = custom_emoji_id
 
     return InlineKeyboardButton(
         **data
@@ -310,19 +278,16 @@ def url_button(
         "style": style,
     }
 
-    custom_emoji_id = (
-        UI_ICONS.get(
+    if icon_key:
+        custom_emoji_id = UI_ICONS.get(
             icon_key,
             "",
         )
-        if icon_key
-        else ""
-    )
 
-    if custom_emoji_id:
-        data["icon_custom_emoji_id"] = (
-            custom_emoji_id
-        )
+        if custom_emoji_id:
+            data[
+                "icon_custom_emoji_id"
+            ] = custom_emoji_id
 
     return InlineKeyboardButton(
         **data
@@ -363,35 +328,19 @@ def close_button() -> InlineKeyboardButton:
 # ================================================================
 
 def copy_button(
-    label: str,
-    text_to_copy: str,
+    command: str,
 ) -> InlineKeyboardButton:
     """
-    دکمه رسمی Telegram برای کپی متن.
+    دستور را به صورت مستقل در Clipboard کپی می‌کند.
     """
 
     return InlineKeyboardButton(
-        text=label,
+        text=f"کپی «{command}»",
         copy_text=CopyTextButton(
-            text=text_to_copy,
+            text=command
         ),
         style=PRIMARY,
     )
-
-
-def command_copy_row(
-    command: str,
-) -> list[InlineKeyboardButton]:
-    """
-    هر دستور یک دکمه Copy مستقل دارد.
-    """
-
-    return [
-        copy_button(
-            f"کپی «{command}»",
-            command,
-        )
-    ]
 
 
 # ================================================================
@@ -417,7 +366,7 @@ def add_to_group_button(
 
 
 # ================================================================
-# HELP CONTENT
+# HELP TEXTS
 # ================================================================
 
 HELP_TOPICS: dict[str, str] = {
@@ -426,11 +375,12 @@ HELP_TOPICS: dict[str, str] = {
         "🚀 <b>شروع ECHO</b>\n\n"
         "ECHO یک بازی چندنفره متنی است.\n\n"
         "هر گروه یک شهر مستقل در دنیای ECHO است.\n\n"
-        "<b>برای شروع:</b>\n"
+        "<b>شروع بازی:</b>\n"
         "۱. ECHO را به گروه اضافه کن.\n"
         "۲. وارد شهر شو.\n"
-        "۳. یکی از عبارت‌های زیر را در گروه بفرست.\n\n"
-        "برای بازی معمولی، نیازی به حفظ دستورهای خاص نداری."
+        "۳. عبارت موردنظر را در گروه بفرست.\n\n"
+        "در بازی معمولی نیازی به استفاده از دستورهای "
+        "پیچیده نداری."
     ),
 
     "mission": (
@@ -438,26 +388,28 @@ HELP_TOPICS: dict[str, str] = {
         "<b>چیست؟</b>\n"
         "مأموریت‌ها هدف‌های مشخصی هستند که با انجام آن‌ها پاداش می‌گیری.\n\n"
         "<b>چطور استفاده کنم؟</b>\n"
-        "برای شروع، عبارت زیر را در گروه بفرست:\n\n"
+        "عبارت زیر را در گروه بفرست:"
+        "\n\n"
         "🎯 <code>مأموریت</code>\n\n"
         "<b>چه چیزی لازم دارد؟</b>\n"
         "بسته به مأموریت، ممکن است انرژی، پول یا منابع لازم باشد.\n\n"
         "<b>پاداش:</b>\n"
-        "پول، XP، منابع و گاهی Discovery.\n\n"
+        "پول، تجربه، منابع و گاهی کشفیات ویژه.\n\n"
         "<b>روند انجام:</b>\n"
-        "انتخاب مأموریت → بررسی جزئیات → تأیید → شروع مأموریت."
+        "انتخاب مأموریت → بررسی جزئیات → تأیید → شروع."
     ),
 
     "explore": (
         "🧭 <b>اکتشاف</b>\n\n"
         "<b>چیست؟</b>\n"
-        "با اکتشاف می‌توانی مناطق جدید و Discoveryهای نادر را پیدا کنی.\n\n"
+        "با اکتشاف می‌توانی مناطق جدید را بررسی کنی و "
+        "کشفیات ویژه پیدا کنی.\n\n"
         "<b>برای شروع:</b>\n\n"
         "🧭 <code>اکتشاف</code>\n\n"
-        "<b>چه چیزی ممکن است پیدا کنی؟</b>\n"
-        "پول، منابع، Discovery و اتفاق‌های ویژه.\n\n"
+        "<b>ممکن است چه چیزی پیدا کنی؟</b>\n"
+        "پول، منابع، کشفیات ویژه یا یک اتفاق غیرمنتظره.\n\n"
         "<b>نکته:</b>\n"
-        "نتیجه هر اکتشاف مشخص نیست و بعضی مناطق خطر دارند."
+        "نتیجه هر اکتشاف مشخص نیست."
     ),
 
     "market": (
@@ -466,8 +418,8 @@ HELP_TOPICS: dict[str, str] = {
         "بازار محل خرید و فروش دارایی‌های بازی است.\n\n"
         "<b>برای ورود:</b>\n\n"
         "📈 <code>بازار</code>\n\n"
-        "<b>قیمت‌ها ثابت هستند؟</b>\n"
-        "نه. عرضه و تقاضا می‌توانند قیمت‌ها را تغییر دهند.\n\n"
+        "<b>قیمت‌ها چگونه تعیین می‌شوند؟</b>\n"
+        "عرضه و تقاضا می‌توانند روی قیمت‌ها اثر بگذارند.\n\n"
         "<b>نکته:</b>\n"
         "هیچ معامله‌ای سود قطعی ندارد."
     ),
@@ -478,18 +430,18 @@ HELP_TOPICS: dict[str, str] = {
         "کار یکی از روش‌های کسب درآمد در ECHO است.\n\n"
         "<b>برای شروع:</b>\n\n"
         "💼 <code>کار</code>\n\n"
-        "<b>چه چیزی روی نتیجه اثر می‌گذارد؟</b>\n"
-        "نوع کار، انرژی، زمان و سطح بازیکن.\n\n"
+        "<b>چه چیزهایی مهم هستند؟</b>\n"
+        "نوع فعالیت، انرژی، سطح بازیکن و شرایط بازار.\n\n"
         "<b>نکته:</b>\n"
-        "همه کارها درآمد یکسان ندارند."
+        "همه فعالیت‌ها درآمد یکسان ندارند."
     ),
 
     "guild": (
-        "⚔️ <b>Guild</b>\n\n"
-        "Guild یک گروه از بازیکنان است که با هم همکاری می‌کنند.\n\n"
+        "⚔️ <b>گیلد</b>\n\n"
+        "گیلد یک گروه از بازیکنان است که با هم همکاری می‌کنند.\n\n"
         "<b>برای مشاهده:</b>\n\n"
         "⚔️ <code>گیلد</code>\n\n"
-        "در آینده Guildها در رقابت‌های گروهی و رویدادهای بزرگ نقش خواهند داشت."
+        "گیلدها در رقابت‌ها و رویدادهای گروهی نقش خواهند داشت."
     ),
 
     "rank": (
@@ -497,30 +449,30 @@ HELP_TOPICS: dict[str, str] = {
         "رتبه‌بندی جایگاه بازیکنان را در شهر نشان می‌دهد.\n\n"
         "<b>برای مشاهده:</b>\n\n"
         "🏆 <code>رتبه</code>\n\n"
-        "رتبه می‌تواند با سطح، تجربه، فعالیت و عملکرد بازیکن تغییر کند."
+        "رتبه می‌تواند با سطح، تجربه و فعالیت بازیکن تغییر کند."
     ),
 
     "profile": (
         "👤 <b>پروفایل</b>\n\n"
-        "پروفایل اطلاعات کلی و وضعیت تو در شهر را نشان می‌دهد.\n\n"
+        "پروفایل وضعیت کلی و وضعیت تو در شهر را نمایش می‌دهد.\n\n"
         "<b>برای مشاهده:</b>\n\n"
         "👤 <code>پروفایل</code>\n\n"
-        "اطلاعات کلی و اطلاعات مربوط به همین شهر از هم جدا نمایش داده می‌شوند."
+        "اطلاعات کلی و اطلاعات مربوط به شهر از هم جدا هستند."
     ),
 
     "city": (
         "🌆 <b>شهر</b>\n\n"
-        "هر گروه یک شهر مستقل است.\n\n"
+        "هر گروه یک شهر مستقل در دنیای ECHO است.\n\n"
         "<b>برای مشاهده وضعیت شهر:</b>\n\n"
         "🌆 <code>شهر</code>\n\n"
-        "در این بخش می‌توانی سطح، جمعیت، خزانه و وضعیت فعالیت شهر را ببینی."
+        "در این بخش می‌توانی سطح، جمعیت، خزانه و فعالیت شهر را ببینی."
     ),
 
     "rules": (
         "📜 <b>قوانین ECHO</b>\n\n"
         "۱. استفاده از باگ یا روش غیرمجاز ممنوع است.\n"
-        "۲. ایجاد اختلال عمدی در روند بازی ممنوع است.\n"
-        "۳. پاداش‌ها و دارایی‌ها نباید با روش غیرمجاز افزایش پیدا کنند.\n"
+        "۲. ایجاد اختلال عمدی در بازی ممنوع است.\n"
+        "۳. افزایش غیرمجاز دارایی‌ها ممنوع است.\n"
         "۴. هر بازیکن مسئول حساب خودش است.\n"
         "۵. رفتار مناسب با دیگر بازیکنان الزامی است."
     ),
@@ -529,20 +481,17 @@ HELP_TOPICS: dict[str, str] = {
         "ℹ️ <b>درباره ECHO</b>\n\n"
         "ECHO یک دنیای بازی متنی برای گروه‌های Telegram است.\n\n"
         "هر گروه یک شهر است.\n"
-        "بازیکنان در شهر خود فعالیت می‌کنند، با هم رقابت می‌کنند و در رویدادهای جمعی شرکت می‌کنند."
+        "بازیکنان در شهر خود فعالیت می‌کنند، "
+        "رقابت می‌کنند و در رویدادهای جمعی شرکت می‌کنند."
     ),
 }
 
 
-# ================================================================
-# HELP MAIN
-# ================================================================
-
 HELP_MAIN_TEXT = (
     "📚 <b>مرکز راهنمای ECHO</b>\n\n"
     "بخش موردنظر را انتخاب کن.\n\n"
-    "در هر راهنما، عبارت مربوط به آن بخش را "
-    "به صورت جداگانه می‌بینی و می‌توانی با یک لمس آن را کپی کنی."
+    "در راهنمای هر بخش، عبارت قابل استفاده "
+    "به صورت جداگانه قرار دارد تا بتوانی آن را سریع کپی کنی."
 )
 
 
@@ -578,7 +527,7 @@ def help_main_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             primary_button(
-                "Guild",
+                "گیلد",
                 "help:guild",
                 "guild",
             )
@@ -619,6 +568,55 @@ def help_main_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def help_topic_keyboard(
+    topic: str,
+) -> InlineKeyboardMarkup:
+
+    command_map = {
+        "mission": "مأموریت",
+        "explore": "اکتشاف",
+        "market": "بازار",
+        "work": "کار",
+        "guild": "گیلد",
+        "rank": "رتبه",
+        "profile": "پروفایل",
+        "city": "شهر",
+    }
+
+    rows: list[
+        list[InlineKeyboardButton]
+    ] = []
+
+    command = command_map.get(
+        topic
+    )
+
+    if command:
+        rows.append(
+            [
+                copy_button(
+                    command
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            back_button()
+        ]
+    )
+
+    rows.append(
+        [
+            close_button()
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
 # ================================================================
 # PRIVATE START
 # ================================================================
@@ -632,14 +630,6 @@ async def private_start(
 ) -> None:
 
     bot_info = await bot.get_me()
-
-    text = (
-        "🌐 <b>ECHO</b>\n\n"
-        "ECHO یک بازی چندنفره متنی است.\n\n"
-        "هر گروه یک شهر از دنیای ECHO است.\n\n"
-        "بازی اصلی داخل گروه انجام می‌شود.\n"
-        "ECHO را به گروه خودت اضافه کن و بازی را با اعضای گروه شروع کن."
-    )
 
     keyboard = build_keyboard(
         [
@@ -675,7 +665,13 @@ async def private_start(
 
     await safe_answer(
         message,
-        text,
+        (
+            "🌐 <b>ECHO</b>\n\n"
+            "ECHO یک بازی چندنفره متنی است.\n\n"
+            "هر گروه یک شهر در دنیای ECHO است.\n\n"
+            "بازی اصلی داخل گروه انجام می‌شود.\n"
+            "ECHO را به گروه خودت اضافه کن و بازی را با اعضای گروه شروع کن."
+        ),
         keyboard,
     )
 
@@ -717,19 +713,7 @@ async def private_gameplay_redirect(
 
     text = (
         message.text or ""
-    ).strip()
-
-    normalized = (
-        text.replace(
-            "ي",
-            "ی",
-        )
-        .replace(
-            "ك",
-            "ک",
-        )
-        .lower()
-    )
+    ).strip().lower()
 
     gameplay_words = (
         "مأموریت",
@@ -738,40 +722,37 @@ async def private_gameplay_redirect(
         "اکتشاف",
         "بازار",
         "گیلد",
-        "guild",
         "رتبه",
         "پروفایل",
         "شهر",
     )
 
     if not any(
-        word in normalized
+        word in text
         for word in gameplay_words
     ):
         return
 
     bot_info = await bot.get_me()
 
-    keyboard = build_keyboard(
-        [
-            add_to_group_button(
-                bot_info.username
-            )
-        ],
-    )
-
     await safe_answer(
         message,
         (
             "🎮 <b>بازی اصلی ECHO داخل گروه انجام می‌شود.</b>\n\n"
-            "ربات را به یک گروه اضافه کن و از همان‌جا بازی را شروع کن."
+            "ربات را به یک گروه اضافه کن و بازی را از همان‌جا شروع کن."
         ),
-        keyboard,
+        build_keyboard(
+            [
+                add_to_group_button(
+                    bot_info.username
+                )
+            ]
+        ),
     )
 
 
 # ================================================================
-# HELP CALLBACK - PRIVATE
+# PRIVATE HELP CALLBACK
 # ================================================================
 
 @private_router.callback_query(
@@ -796,7 +777,7 @@ async def private_help_callback(
 
     if topic == "main":
 
-        await safe_edit(
+        await safe_edit_or_send(
             callback.message,
             HELP_MAIN_TEXT,
             help_main_keyboard(),
@@ -811,19 +792,17 @@ async def private_help_callback(
     if not text:
         return
 
-    keyboard = help_topic_keyboard(
-        topic
-    )
-
     await safe_edit_or_send(
         callback.message,
         text,
-        keyboard,
+        help_topic_keyboard(
+            topic
+        ),
     )
 
 
 # ================================================================
-# HELP CALLBACK - GROUP
+# GROUP HELP CALLBACK
 # ================================================================
 
 @group_router.callback_query(
@@ -848,7 +827,7 @@ async def group_help_callback(
 
     if topic == "main":
 
-        await safe_edit(
+        await safe_edit_or_send(
             callback.message,
             HELP_MAIN_TEXT,
             help_main_keyboard(),
@@ -863,70 +842,12 @@ async def group_help_callback(
     if not text:
         return
 
-    keyboard = help_topic_keyboard(
-        topic
-    )
-
     await safe_edit_or_send(
         callback.message,
         text,
-        keyboard,
-    )
-
-
-def help_topic_keyboard(
-    topic: str,
-) -> InlineKeyboardMarkup:
-
-    rows: list[
-        list[InlineKeyboardButton]
-    ] = []
-
-    # ------------------------------------------------------------
-    # دستور مخصوص همان بخش
-    # ------------------------------------------------------------
-
-    command_map = {
-        "mission": "مأموریت",
-        "explore": "اکتشاف",
-        "market": "بازار",
-        "work": "کار",
-        "guild": "گیلد",
-        "rank": "رتبه",
-        "profile": "پروفایل",
-        "city": "شهر",
-    }
-
-    command = command_map.get(
-        topic
-    )
-
-    if command:
-
-        rows.append(
-            command_copy_row(
-                command
-            )
-        )
-
-    # ------------------------------------------------------------
-    # Navigation
-    # ------------------------------------------------------------
-
-    rows.append(
-        [
-            back_button()
-        ]
-    )
-
-    rows.append(
-        [
-            close_button()
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows
+        help_topic_keyboard(
+            topic
+        ),
     )
 
 
@@ -977,7 +898,7 @@ async def group_close(
 
 
 # ================================================================
-# BOT ADDED / REMOVED
+# BOT GROUP MEMBERSHIP
 # ================================================================
 
 def bot_was_added(
@@ -1036,6 +957,10 @@ async def group_membership_handler(
     bot: Bot,
 ) -> None:
 
+    # ------------------------------------------------------------
+    # BOT REMOVED
+    # ------------------------------------------------------------
+
     if bot_was_removed(
         event
     ):
@@ -1050,17 +975,22 @@ async def group_membership_handler(
                 )
 
             logger.info(
-                "City disabled: %s",
+                "City disabled: chat_id=%s",
                 event.chat.id,
             )
 
         except Exception:
 
             logger.exception(
-                "Failed to disable City."
+                "Failed to disable City: chat_id=%s",
+                event.chat.id,
             )
 
         return
+
+    # ------------------------------------------------------------
+    # BOT ADDED
+    # ------------------------------------------------------------
 
     if not bot_was_added(
         event
@@ -1077,6 +1007,29 @@ async def group_membership_handler(
 
         async with get_session() as session:
 
+            # ----------------------------------------------------
+            # اول مالک را ایجاد می‌کنیم
+            # ----------------------------------------------------
+
+            if event.from_user:
+
+                await get_or_create_user(
+                    session=session,
+                    user_id=event.from_user.id,
+                    username=(
+                        event.from_user.username
+                    ),
+                    nickname=(
+                        event.from_user.first_name
+                        or event.from_user.username
+                        or f"بازیکن {event.from_user.id}"
+                    ),
+                )
+
+            # ----------------------------------------------------
+            # بعد شهر ساخته می‌شود
+            # ----------------------------------------------------
+
             city = await get_or_restore_city(
                 session=session,
                 telegram_chat_id=event.chat.id,
@@ -1088,12 +1041,12 @@ async def group_membership_handler(
                 owner_user_id=actor_id,
             )
 
+            city_id = city.id
+
             city_name = (
                 city.custom_name
                 or city.name
             )
-
-            city_id = city.id
 
         keyboard = build_keyboard(
             [
@@ -1115,9 +1068,9 @@ async def group_membership_handler(
         await bot.send_message(
             event.chat.id,
             (
-                "🌆 <b>ECHO City فعال شد</b>\n\n"
+                "🌆 <b>شهر ECHO فعال شد</b>\n\n"
                 f"نام شهر: <b>{escape_html(city_name)}</b>\n\n"
-                "این گروه حالا یک شهر از دنیای ECHO است.\n\n"
+                "این گروه حالا یک شهر در دنیای ECHO است.\n\n"
                 "برای شروع، وارد شهر شو."
             ),
             reply_markup=keyboard,
@@ -1127,12 +1080,129 @@ async def group_membership_handler(
     except Exception:
 
         logger.exception(
-            "Failed to create City."
+            "Failed to initialize City: chat_id=%s",
+            event.chat.id,
         )
 
 
 # ================================================================
-# CITY JOIN
+# TEXT: ورود
+# ================================================================
+
+@group_router.message(
+    F.text.func(
+        lambda text: (
+            text or ""
+        ).strip()
+        in {
+            "ورود",
+            "وارد شدن",
+            "شروع بازی",
+        }
+    )
+)
+async def group_enter_city(
+    message: Message,
+) -> None:
+
+    if not message.from_user:
+        return
+
+    try:
+
+        async with get_session() as session:
+
+            city = await get_city_by_chat(
+                session,
+                message.chat.id,
+            )
+
+            if city is None:
+
+                city = await get_or_restore_city(
+                    session=session,
+                    telegram_chat_id=message.chat.id,
+                    name=(
+                        message.chat.title
+                        or "ECHO City"
+                    ),
+                    username=(
+                        message.chat.username
+                    ),
+                    owner_user_id=(
+                        message.from_user.id
+                    ),
+                )
+
+            if not city.is_active:
+
+                return
+
+            # User first.
+            await get_or_create_user(
+                session=session,
+                user_id=message.from_user.id,
+                username=(
+                    message.from_user.username
+                ),
+                nickname=(
+                    message.from_user.first_name
+                    or message.from_user.username
+                    or f"بازیکن {message.from_user.id}"
+                ),
+            )
+
+            member = (
+                await get_or_create_city_member(
+                    session=session,
+                    city_id=city.id,
+                    user_id=message.from_user.id,
+                )
+            )
+
+            city_name = (
+                city.custom_name
+                or city.name
+            )
+
+        if member:
+
+            await safe_answer(
+                message,
+                (
+                    f"✅ <b>به {escape_html(city_name)} خوش آمدی.</b>\n\n"
+                    "حالا می‌توانی بازی را شروع کنی.\n\n"
+                    "برای شروع:"
+                )
+                + "\n\n"
+                + "<code>مأموریت</code>",
+                build_keyboard(
+                    [
+                        copy_button(
+                            "کپی «مأموریت»"
+                        )
+                    ],
+                    [
+                        primary_button(
+                            "راهنمای بازی",
+                            "help:start",
+                            "help",
+                        )
+                    ],
+                ),
+            )
+
+    except Exception:
+
+        logger.exception(
+            "City entry failed: user=%s chat=%s",
+            message.from_user.id,
+            message.chat.id,
+        )
+
+
+# ================================================================
+# CALLBACK: CITY JOIN
 # ================================================================
 
 @group_router.callback_query(
@@ -1143,6 +1213,7 @@ async def city_join_callback(
 ) -> None:
 
     if not callback.message:
+
         await callback.answer()
         return
 
@@ -1170,7 +1241,27 @@ async def city_join_callback(
 
         async with get_session() as session:
 
-            db_user = await get_or_create_user(
+            city_result = await session.execute(
+                select(City).where(
+                    City.id == city_id
+                )
+            )
+
+            city = (
+                city_result
+                .scalar_one_or_none()
+            )
+
+            if city is None:
+
+                await callback.answer(
+                    "این شهر پیدا نشد.",
+                    show_alert=True,
+                )
+
+                return
+
+            await get_or_create_user(
                 session=session,
                 user_id=user.id,
                 username=user.username,
@@ -1183,29 +1274,9 @@ async def city_join_callback(
 
             await get_or_create_city_member(
                 session=session,
-                city_id=city_id,
+                city_id=city.id,
                 user_id=user.id,
             )
-
-            result = await session.execute(
-                select(City).where(
-                    City.id == city_id
-                )
-            )
-
-            city = (
-                result
-                .scalar_one_or_none()
-            )
-
-            if city is None:
-
-                await callback.answer(
-                    "این شهر پیدا نشد.",
-                    show_alert=True,
-                )
-
-                return
 
             city_name = (
                 city.custom_name
@@ -1220,16 +1291,15 @@ async def city_join_callback(
             callback.message,
             (
                 f"✅ <b>به {escape_html(city_name)} خوش آمدی.</b>\n\n"
-                "حالا بازی را شروع کن.\n\n"
-                "برای شروع بنویس:"
-            )
-            + "\n\n"
-            + "<code>مأموریت</code>",
+                "بازی را می‌توانی از همین حالا شروع کنی.\n\n"
+                "برای شروع:"
+                "\n\n"
+                "<code>مأموریت</code>"
+            ),
             build_keyboard(
                 [
                     copy_button(
-                        "کپی «مأموریت»",
-                        "مأموریت",
+                        "کپی «مأموریت»"
                     )
                 ],
                 [
@@ -1245,7 +1315,9 @@ async def city_join_callback(
     except Exception:
 
         logger.exception(
-            "City join failed."
+            "City join failed: user=%s city=%s",
+            user.id,
+            city_id,
         )
 
         await callback.answer(
@@ -1255,7 +1327,7 @@ async def city_join_callback(
 
 
 # ================================================================
-# GROUP MESSAGE HANDLER
+# GROUP TEXT GAME
 # ================================================================
 
 @group_router.message(
@@ -1279,16 +1351,16 @@ async def group_message_handler(
 
         async with get_session() as session:
 
+            # ----------------------------------------------------
+            # City را پیدا کن.
+            # اگر Event قبلی از دست رفته بود،
+            # همین‌جا شهر ساخته می‌شود.
+            # ----------------------------------------------------
+
             city = await get_city_by_chat(
                 session,
                 message.chat.id,
             )
-
-            # ----------------------------------------------------
-            # مهم:
-            # اگر رویداد اضافه‌شدن ربات از دست رفته باشد،
-            # با اولین پیام بازی City ساخته می‌شود.
-            # ----------------------------------------------------
 
             if city is None:
 
@@ -1300,7 +1372,9 @@ async def group_message_handler(
                         or "ECHO City"
                     ),
                     username=message.chat.username,
-                    owner_user_id=message.from_user.id,
+                    owner_user_id=(
+                        message.from_user.id
+                    ),
                 )
 
             if not city.is_active:
@@ -1351,117 +1425,49 @@ async def group_message_handler(
     except Exception:
 
         logger.exception(
-            "Group message failed: "
-            "user=%s chat=%s",
+            "Group message failed: user=%s chat=%s text=%r",
             message.from_user.id,
             message.chat.id,
+            text[:100],
         )
 
 
 # ================================================================
-# PUBLIC ACTIONS
+# GAME RESPONSE RENDERER
 # ================================================================
 
-@group_router.callback_query(
-    F.data.startswith("echo:action:")
-)
-async def group_action_callback(
-    callback: CallbackQuery,
-) -> None:
-
-    if not callback.message:
-        await callback.answer()
-        return
-
-    action = (
-        callback.data or ""
-    ).split(
-        ":",
-        2,
-    )[-1]
-
-    await callback.answer()
-
-    # این بخش فعلاً فقط Foundation است.
-    # منطق رأی و Event در نسخه کامل Game Engine
-    # باید Server-Side پردازش شود.
-
-    if action == "VOTE_YES":
-
-        await safe_answer(
-            callback.message,
-            "✅ رأی تو ثبت شد.",
-        )
-        return
-
-    if action == "VOTE_NO":
-
-        await safe_answer(
-            callback.message,
-            "🔴 رأی تو ثبت شد.",
-        )
-        return
-
-    if action == "JOIN_EVENT":
-
-        await safe_answer(
-            callback.message,
-            "✅ درخواست شرکت در رویداد ثبت شد.",
-        )
-        return
-
-    if action == "VIEW_EVENT":
-
-        await safe_answer(
-            callback.message,
-            "جزئیات رویداد هنوز آماده نیست.",
-        )
-        return
-
-    await safe_answer(
-        callback.message,
-        "این گزینه هنوز فعال نیست.",
-    )
-
-
-# ================================================================
-# RESPONSE RENDERER
-# ================================================================
-
-def response_keyboard(
+def build_response_keyboard(
     response: GameResponse,
 ) -> Optional[
     InlineKeyboardMarkup
 ]:
 
     if not response.actions:
-
         return None
 
     rows = []
 
     for action in response.actions:
 
-        callback_data = (
-            f"echo:action:"
-            f"{action.action}"
-        )
-
-        style = (
-            action.style
-            .value
-            .lower()
-        )
-
         rows.append(
             [
                 make_button(
-                    action.label,
-                    callback_data,
-                    style,
+                    text=action.label,
+                    callback_data=(
+                        f"echo:action:"
+                        f"{action.action}"
+                    ),
+                    style=(
+                        action.style
+                        .value
+                        .lower()
+                    ),
                 )
             ]
         )
+
+    if not rows:
+        return None
 
     return InlineKeyboardMarkup(
         inline_keyboard=rows
@@ -1484,11 +1490,14 @@ async def render_game_response(
 
     keyboard = None
 
-    # فقط زمانی Button نمایش داده می‌شود
-    # که Response واقعاً رابط کاربری بخواهد.
+    # دکمه فقط زمانی نمایش داده می‌شود
+    # که پاسخ واقعاً رابط تعاملی بخواهد.
     if response.requires_ui:
-        keyboard = response_keyboard(
-            response
+
+        keyboard = (
+            build_response_keyboard(
+                response
+            )
         )
 
     if response.public:
@@ -1516,6 +1525,181 @@ async def render_game_response(
         message,
         response.text,
         keyboard,
+    )
+
+
+# ================================================================
+# PUBLIC ACTIONS
+# ================================================================
+
+@group_router.callback_query(
+    F.data.startswith("echo:action:")
+)
+async def public_action_callback(
+    callback: CallbackQuery,
+) -> None:
+
+    if not callback.message:
+
+        await callback.answer()
+        return
+
+    action = (
+        callback.data or ""
+    ).split(
+        ":",
+        2,
+    )[-1]
+
+    if action == "VOTE_YES":
+
+        await callback.answer(
+            "رأی تو ثبت شد."
+        )
+        return
+
+    if action == "VOTE_NO":
+
+        await callback.answer(
+            "رأی تو ثبت شد."
+        )
+        return
+
+    if action == "JOIN_EVENT":
+
+        await callback.answer(
+            "درخواست شرکت در رویداد ثبت شد."
+        )
+        return
+
+    if action == "VIEW_EVENT":
+
+        await callback.answer(
+            "جزئیات رویداد آماده نیست."
+        )
+        return
+
+    await callback.answer(
+        "این گزینه هنوز فعال نیست.",
+        show_alert=True,
+    )
+
+
+# ================================================================
+# PUBLIC EVENT HELPERS
+# ================================================================
+
+async def send_public_event(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    actions: Optional[
+        list[ActionButton]
+    ] = None,
+) -> Optional[Message]:
+
+    keyboard = None
+
+    if actions:
+
+        rows = []
+
+        for action in actions:
+
+            rows.append(
+                [
+                    make_button(
+                        action.label,
+                        (
+                            f"echo:action:"
+                            f"{action.action}"
+                        ),
+                        action.style.value.lower(),
+                    )
+                ]
+            )
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=rows
+        )
+
+    try:
+
+        return await bot.send_message(
+            chat_id,
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Public event send failed."
+        )
+
+        return None
+
+
+async def send_public_vote(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    yes_callback: str,
+    no_callback: str,
+) -> Optional[Message]:
+
+    keyboard = build_keyboard(
+        [
+            success_button(
+                "موافقم",
+                yes_callback,
+                "vote",
+            ),
+            danger_button(
+                "مخالفم",
+                no_callback,
+            ),
+        ]
+    )
+
+    try:
+
+        return await bot.send_message(
+            chat_id,
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Public vote send failed."
+        )
+
+        return None
+
+
+# ================================================================
+# BOT COMMAND MENU
+# ================================================================
+
+async def setup_bot_commands(
+    bot: Bot,
+) -> None:
+
+    await bot.set_my_commands(
+        [
+            BotCommand(
+                command="start",
+                description="شروع ECHO",
+            ),
+            BotCommand(
+                command="help",
+                description="راهنمای ECHO",
+            ),
+        ]
     )
 
 
@@ -1622,124 +1806,7 @@ def escape_html(
 
 
 # ================================================================
-# PUBLIC EVENT HELPERS
-# ================================================================
-
-async def send_public_event(
-    bot: Bot,
-    chat_id: int,
-    text: str,
-    actions: Optional[
-        list[ActionButton]
-    ] = None,
-) -> Optional[Message]:
-
-    keyboard = None
-
-    if actions:
-
-        rows = []
-
-        for action in actions:
-
-            rows.append(
-                [
-                    make_button(
-                        action.label,
-                        f"echo:action:{action.action}",
-                        action.style.value.lower(),
-                    )
-                ]
-            )
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=rows
-        )
-
-    try:
-
-        return await bot.send_message(
-            chat_id,
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Public event send failed."
-        )
-
-        return None
-
-
-async def send_public_vote(
-    bot: Bot,
-    chat_id: int,
-    text: str,
-    yes_callback: str,
-    no_callback: str,
-) -> Optional[Message]:
-
-    keyboard = build_keyboard(
-        [
-            success_button(
-                "موافقم",
-                yes_callback,
-                "vote",
-            ),
-            danger_button(
-                "مخالفم",
-                no_callback,
-            ),
-        ]
-    )
-
-    try:
-
-        return await bot.send_message(
-            chat_id,
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Public vote send failed."
-        )
-
-        return None
-
-
-# ================================================================
-# BOT COMMAND MENU
-# ================================================================
-
-async def setup_bot_commands(
-    bot: Bot,
-) -> None:
-
-    from aiogram.types import BotCommand
-
-    await bot.set_my_commands(
-        [
-            BotCommand(
-                command="start",
-                description="شروع ECHO",
-            ),
-            BotCommand(
-                command="help",
-                description="راهنمای ECHO",
-            ),
-        ]
-    )
-
-
-# ================================================================
-# HANDLER SETUP
+# SETUP
 # ================================================================
 
 def register_handlers(
@@ -1771,6 +1838,7 @@ def setup_handlers(
 __all__ = [
     "private_router",
     "group_router",
+
     "register_handlers",
     "setup_handlers",
     "setup_bot_commands",
